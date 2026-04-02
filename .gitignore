@@ -1,0 +1,7 @@
+logs/
+checkpoints/
+wandb/
+__pycache__/
+*.log
+eval_results/
+plots/
