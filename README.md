@@ -24,102 +24,162 @@ This repo implements and compares 6 such variants under matched compute and iden
 
 ---
 
-## Per-Variant Architecture & Update Equations
+## From Optimizers to Transformer Architectures
 
-All variants share the same backbone: 12 layers, 12 heads, $d_{\text{model}}=768$, GPT-2 BPE tokenizer (50304 vocab), causal self-attention + 4× MLP, weight-tied output head, pre-norm. They differ **only** in the per-layer block update rule, and in the auxiliary streams (velocity $v$, first moment $m$, second moment $s$) propagated alongside the hidden state $x$.
+Following Zimin et al. (2026), we view a transformer block as one iteration of a first-order optimization algorithm acting on the token-embedding matrix $X_t \in \mathbb{R}^{T \times d}$. The composite objective is
 
-The two oracles in every block are
+$$\min_X \; \mathcal{E}(X) + \mathcal{F}(X),$$
 
-$$g_{\text{attn}}(x) \;=\; \mathrm{Attn}\!\bigl(\mathrm{LN}(x)\bigr), \qquad g_{\text{mlp}}(x) \;=\; \mathrm{MLP}\!\bigl(\mathrm{LN}(x)\bigr).$$
+where $\mathcal{E}$ is an interaction energy (token–token) and $\mathcal{F}$ is a potential energy (per-token). Their gradients are realized by the two transformer oracles:
 
-Each block performs two substeps (Lie–Trotter splitting): an attention substep followed by an MLP substep. Every per-layer scalar ($\mu, \beta, \gamma, \nu, \lambda$) is **learned**, parameterized via $\sigma(\cdot)$ for values in $(0,1)$ or $\mathrm{softplus}(\cdot)$ for positives. Subscripts $a/m$ denote attention/MLP substep parameters.
+$$\nabla \mathcal{E}_t(X) \;\approx\; \mathrm{Attn}_t\!\bigl(\mathrm{LN}(X)\bigr), \qquad \nabla \mathcal{F}_t(X) \;\approx\; \mathrm{MLP}_t\!\bigl(\mathrm{LN}(X)\bigr).$$
 
-### 1. `VanillaTransformer` — GD + Lie–Trotter
+A first-order optimization template applied to $\mathcal{E} + \mathcal{F}$ via **Lie–Trotter splitting** then yields a transformer block: each layer performs an attention substep (gradient step on $\mathcal{E}$) followed by an MLP substep (gradient step on $\mathcal{F}$). Different optimizer templates → different transformer architectures.
 
-Standard pre-norm nanoGPT block. No auxiliary stream, no learned scalars.
+All five variants share the same 12L/12H/$d=768$ pre-norm backbone, GPT-2 BPE tokenizer, and weight-tied output head — they differ **only** in the optimizer template and in the auxiliary streams ($V_t$, $M_t$, $S_t$) propagated alongside the state $X_t$. Per-layer scalars ($\mu, \beta, \gamma, \nu, \lambda$) are all learned, reparameterized through $\sigma$ for $(0,1)$ values or $\mathrm{softplus}$ for positives.
 
-$$
-\begin{aligned}
-x &\;\leftarrow\; x + g_{\text{attn}}(x) \\
-x &\;\leftarrow\; x + g_{\text{mlp}}(x)
-\end{aligned}
-$$
+---
 
-One step of **gradient descent** with unit step size on the composite objective $f_{\text{attn}} + f_{\text{mlp}}$, split via Lie–Trotter. The "gradients" are the oracle outputs themselves — the layer **is** the optimization step.
+### 1. `VanillaTransformer` — Gradient Descent
 
-### 2. `YuriiFormer` — Nesterov + Lie–Trotter
+**Optimizer (gradient descent on $f$):**
 
-Maintains a parallel velocity stream $v$, initialized from a separate learned velocity embedding. **6 learned scalars per layer.**
+$$x_{t+1} \;=\; x_t - \gamma_t \, \nabla f(x_t).$$
 
-Attention substep:
+**Transformer (Lie–Trotter splitting of GD on $\mathcal{E} + \mathcal{F}$):**
 
 $$
 \begin{aligned}
-\tilde{x} &\;=\; x + \mu_a\, v &&\text{(Nesterov lookahead)}\\
-v &\;\leftarrow\; \mathrm{LN}_v\!\bigl(\beta_a\, v + \gamma_a\, g_{\text{attn}}(\tilde{x})\bigr) \\
-x &\;\leftarrow\; x + v
+X_{t+\frac{1}{2}} &\;=\; X_t \;+\; \mathrm{Attn}_t(X_t) \\
+X_{t+1} &\;=\; X_{t+\frac{1}{2}} \;+\; \mathrm{MLP}_t(X_{t+\frac{1}{2}})
 \end{aligned}
 $$
 
-MLP substep (analogous, with $\mu_m, \beta_m, \gamma_m$ and $g_{\text{mlp}}$).
+This is the standard pre-norm nanoGPT block: no auxiliary stream, no learned scalars, step size absorbed into the oracles. Recovers eq. (5) of Zimin et al. (2026).
 
-One step of **Nesterov accelerated gradient** per substep: the oracle is queried at the lookahead $x + \mu v$, velocity is an EMA of past oracle outputs, and the iterate advances by the full velocity.
+---
 
-### 3. `TMMFormer` — Triple Momentum Method + Lie–Trotter
+### 2. `YuriiFormer` — Nesterov Accelerated Gradient
 
-Strict generalization of YuriiFormer: adds a second learned scalar $\nu$ that decouples the iterate update from the gradient lookahead. **8 learned scalars per layer.**
-
-Attention substep:
+**Optimizer (Nesterov, 1983).** Given iterate $x_t$ and velocity $v_t$:
 
 $$
 \begin{aligned}
-\tilde{x} &\;=\; x + \mu_a\, v &&\text{(gradient lookahead)}\\
-v &\;\leftarrow\; \mathrm{LN}_v\!\bigl(\beta_a\, v + \gamma_a\, g_{\text{attn}}(\tilde{x})\bigr) \\
-x &\;\leftarrow\; x + \nu_a\, v &&\text{(iterate update, } \nu\neq 1\text{ in general)}
+\tilde{x}_t &\;=\; x_t + \mu_t\, v_t & &\text{(lookahead)}\\
+v_{t+1} &\;=\; \beta_t\, v_t - \gamma_t\, \nabla f(\tilde{x}_t) & &\text{(velocity update)}\\
+x_{t+1} &\;=\; x_t + v_{t+1} & &\text{(iterate update)}
 \end{aligned}
 $$
 
-MLP substep is structurally identical with $\mu_m, \beta_m, \gamma_m, \nu_m$.
+**Transformer.** Maintain a velocity stream $V_t$ (from a separate learned embedding) alongside $X_t$. Each layer applies the Nesterov template twice — once with $\mathrm{Attn}$, once with $\mathrm{MLP}$:
 
-The **Triple Momentum Method** (Van Scoy et al., 2018) is the first-order optimal algorithm for $L$-smooth, $\mu$-strongly convex objectives, with convergence rate
+$$
+\begin{aligned}
+X^{\text{in}}_t &\;=\; X_t + \mu_t\, V_t \\
+V_{t+\frac{1}{2}} &\;=\; \mathrm{LN}_v\!\bigl(\beta_t\, V_t + \gamma_t\, \mathrm{Attn}_t(\mathrm{LN}(X^{\text{in}}_t))\bigr) \\
+X_{t+\frac{1}{2}} &\;=\; X_t + V_{t+\frac{1}{2}} \\[2pt]
+X^{\text{in}}_{t+\frac{1}{2}} &\;=\; X_{t+\frac{1}{2}} + \mu_{t+\frac{1}{2}}\, V_{t+\frac{1}{2}} \\
+V_{t+1} &\;=\; \mathrm{LN}_v\!\bigl(\beta_{t+\frac{1}{2}}\, V_{t+\frac{1}{2}} + \gamma_{t+\frac{1}{2}}\, \mathrm{MLP}_t(\mathrm{LN}(X^{\text{in}}_{t+\frac{1}{2}}))\bigr) \\
+X_{t+1} &\;=\; X_{t+\frac{1}{2}} + V_{t+1}
+\end{aligned}
+$$
+
+Six learned scalars per layer ($\mu, \beta, \gamma$ for the attention and MLP substeps). Velocity LayerNorm $\mathrm{LN}_v$ stabilizes the velocity stream across depth. This is the Nesterov+Lie–Trotter variant of Zimin et al. (2026).
+
+---
+
+### 3. `TMMFormer` — Triple Momentum Method
+
+**Optimizer (Van Scoy, Freeman, Lynch, 2018).** TMM is the first-order optimal algorithm for $L$-smooth, $\mu$-strongly convex objectives, with convergence rate
 
 $$\bigl(1 - \sqrt{\mu/L}\bigr)^2,$$
 
-strictly faster than Nesterov's $1 - \sqrt{\mu/L}$. YuriiFormer is the special case $\nu \equiv 1$. We initialize $\nu$ via $\mathrm{softplus}(0.5413) \approx 1$, so training begins in the YuriiFormer regime and learns where to deviate.
-
-### 4. `AdamFormer` — Adam + Lie–Trotter
-
-Maintains **two** auxiliary streams: first moment $m$ (from a learned embedding) and second moment $s$ (initialized to ones). **6 learned scalars per layer.**
-
-Attention substep, with $g = g_{\text{attn}}(x)$:
+strictly better than Nesterov's $1 - \sqrt{\mu/L}$. Its update generalizes Nesterov by introducing a second scalar $\nu_t$ that decouples the **gradient-evaluation lookahead** from the **iterate update**:
 
 $$
 \begin{aligned}
-m &\;\leftarrow\; \beta_{1,a}\, m + (1-\beta_{1,a})\, g \\
-s &\;\leftarrow\; \beta_{2,a}\, s + (1-\beta_{2,a})\, g \odot g \\
-x &\;\leftarrow\; x + \gamma_a\, \mathrm{LN}_u\!\left(\frac{m}{\sqrt{s} + \varepsilon}\right)
+\tilde{x}_t &\;=\; x_t + \mu_t\, v_t & &\text{(lookahead)}\\
+v_{t+1} &\;=\; \beta_t\, v_t - \gamma_t\, \nabla f(\tilde{x}_t) & &\text{(velocity update)}\\
+x_{t+1} &\;=\; x_t + \nu_t\, v_{t+1} & &\text{(iterate update, } \nu_t \neq 1 \text{ in general)}
 \end{aligned}
 $$
 
-MLP substep is structurally identical with $\beta_{1,m}, \beta_{2,m}, \gamma_m$ and $g = g_{\text{mlp}}(x)$.
+YuriiFormer is the special case $\nu_t \equiv 1$.
 
-One step of **Adam** per substep: 1st/2nd moment EMAs propagate forward layer by layer, and the iterate moves along the per-coordinate normalized direction $m / \sqrt{s}$. The extra $\mathrm{LN}_u$ normalizes the adaptive update to keep its magnitude stable across depth.
-
-### 5. `AdamWFormer` — AdamW + Lie–Trotter
-
-Same auxiliary streams and adaptive direction as AdamFormer, but with **decoupled weight decay** on the iterate. **8 learned scalars per layer** (adds $\lambda_a, \lambda_m$).
-
-Attention substep:
+**Transformer.** Apply the TMM template twice per layer (Lie–Trotter):
 
 $$
 \begin{aligned}
-m &\;\leftarrow\; \beta_{1,a}\, m + (1-\beta_{1,a})\, g \\
-s &\;\leftarrow\; \beta_{2,a}\, s + (1-\beta_{2,a})\, g \odot g \\
-x &\;\leftarrow\; (1 - \lambda_a)\, x + \gamma_a\, \mathrm{LN}_u\!\left(\frac{m}{\sqrt{s} + \varepsilon}\right)
+X^{\text{in}}_t &\;=\; X_t + \mu_t\, V_t \\
+V_{t+\frac{1}{2}} &\;=\; \mathrm{LN}_v\!\bigl(\beta_t\, V_t + \gamma_t\, \mathrm{Attn}_t(\mathrm{LN}(X^{\text{in}}_t))\bigr) \\
+X_{t+\frac{1}{2}} &\;=\; X_t + \nu_t\, V_{t+\frac{1}{2}} \\[2pt]
+X^{\text{in}}_{t+\frac{1}{2}} &\;=\; X_{t+\frac{1}{2}} + \mu_{t+\frac{1}{2}}\, V_{t+\frac{1}{2}} \\
+V_{t+1} &\;=\; \mathrm{LN}_v\!\bigl(\beta_{t+\frac{1}{2}}\, V_{t+\frac{1}{2}} + \gamma_{t+\frac{1}{2}}\, \mathrm{MLP}_t(\mathrm{LN}(X^{\text{in}}_{t+\frac{1}{2}}))\bigr) \\
+X_{t+1} &\;=\; X_{t+\frac{1}{2}} + \nu_{t+\frac{1}{2}}\, V_{t+1}
 \end{aligned}
 $$
 
-We initialize $\lambda_* = \sigma(-5) \approx 0.007$, so AdamWFormer starts very close to AdamFormer and learns the per-layer decay. This mirrors AdamW vs. Adam: each iteration pulls the iterate slightly toward zero before applying the adaptive update.
+Eight learned scalars per layer ($\mu, \beta, \gamma, \nu$ for each substep). We initialize $\nu_t$ so that $\mathrm{softplus}(\nu^{\text{raw}}) \approx 1$, so training begins in the YuriiFormer regime and learns where to deviate.
+
+---
+
+### 4. `AdamFormer` — Adam
+
+**Optimizer (Kingma & Ba, 2015).** Adam maintains first/second moment EMAs $m_t, s_t$ of the gradient and rescales each coordinate by the inverse square root of the second moment:
+
+$$
+\begin{aligned}
+g_t &\;=\; \nabla f(x_t) \\
+m_{t+1} &\;=\; \beta_{1,t}\, m_t + (1 - \beta_{1,t})\, g_t \\
+s_{t+1} &\;=\; \beta_{2,t}\, s_t + (1 - \beta_{2,t})\, g_t \odot g_t \\
+x_{t+1} &\;=\; x_t - \gamma_t \, \frac{m_{t+1}}{\sqrt{s_{t+1}} + \varepsilon}
+\end{aligned}
+$$
+
+**Transformer.** Maintain two auxiliary streams alongside $X_t$: a first-moment stream $M_t$ (from a separate learned embedding) and a second-moment stream $S_t$ (initialized to ones). Apply Adam twice per layer:
+
+$$
+\begin{aligned}
+G^{\text{a}}_t &\;=\; \mathrm{Attn}_t(\mathrm{LN}(X_t)) \\
+M_{t+\frac{1}{2}} &\;=\; \beta_{1,t}\, M_t + (1 - \beta_{1,t})\, G^{\text{a}}_t \\
+S_{t+\frac{1}{2}} &\;=\; \beta_{2,t}\, S_t + (1 - \beta_{2,t})\, G^{\text{a}}_t \odot G^{\text{a}}_t \\
+X_{t+\frac{1}{2}} &\;=\; X_t + \gamma_t\, \mathrm{LN}_u\!\!\left(\frac{M_{t+\frac{1}{2}}}{\sqrt{S_{t+\frac{1}{2}}} + \varepsilon}\right) \\[6pt]
+G^{\text{m}}_t &\;=\; \mathrm{MLP}_t(\mathrm{LN}(X_{t+\frac{1}{2}})) \\
+M_{t+1} &\;=\; \beta_{1,t+\frac{1}{2}}\, M_{t+\frac{1}{2}} + (1 - \beta_{1,t+\frac{1}{2}})\, G^{\text{m}}_t \\
+S_{t+1} &\;=\; \beta_{2,t+\frac{1}{2}}\, S_{t+\frac{1}{2}} + (1 - \beta_{2,t+\frac{1}{2}})\, G^{\text{m}}_t \odot G^{\text{m}}_t \\
+X_{t+1} &\;=\; X_{t+\frac{1}{2}} + \gamma_{t+\frac{1}{2}}\, \mathrm{LN}_u\!\!\left(\frac{M_{t+1}}{\sqrt{S_{t+1}} + \varepsilon}\right)
+\end{aligned}
+$$
+
+Six learned scalars per layer ($\beta_1, \beta_2, \gamma$ per substep). The auxiliary $\mathrm{LN}_u$ normalizes the adaptive update direction across depth.
+
+---
+
+### 5. `AdamWFormer` — AdamW
+
+**Optimizer (Loshchilov & Hutter, 2019).** AdamW differs from Adam by **decoupling** weight decay from the adaptive update — the iterate is shrunk toward zero *before* the Adam step:
+
+$$x_{t+1} \;=\; (1 - \lambda_t)\, x_t \;-\; \gamma_t\, \frac{m_{t+1}}{\sqrt{s_{t+1}} + \varepsilon}.$$
+
+**Transformer.** Same auxiliary streams as AdamFormer; the only change is the iterate update of each substep:
+
+$$
+\begin{aligned}
+X_{t+\frac{1}{2}} &\;=\; (1 - \lambda_t)\, X_t \;+\; \gamma_t\, \mathrm{LN}_u\!\!\left(\frac{M_{t+\frac{1}{2}}}{\sqrt{S_{t+\frac{1}{2}}} + \varepsilon}\right) \\[4pt]
+X_{t+1} &\;=\; (1 - \lambda_{t+\frac{1}{2}})\, X_{t+\frac{1}{2}} \;+\; \gamma_{t+\frac{1}{2}}\, \mathrm{LN}_u\!\!\left(\frac{M_{t+1}}{\sqrt{S_{t+1}} + \varepsilon}\right)
+\end{aligned}
+$$
+
+Eight learned scalars per layer (adds $\lambda$ per substep). We initialize $\lambda^{\text{raw}} = -5$ so that $\sigma(\lambda^{\text{raw}}) \approx 0.007$ — the model starts essentially at AdamFormer and learns the optimal per-layer decay.
+
+---
+
+### Common design notes
+
+- **Velocity / update LayerNorm.** $\mathrm{LN}_v$ (in YuriiFormer / TMMFormer) and $\mathrm{LN}_u$ (in AdamFormer / AdamWFormer) are essential for stability across depth: without them, momentum-based architectures diverge after a few hundred steps.
+- **Auxiliary stream initialization.** $V_0$ and $M_0$ are produced by *separate learned embeddings* (`vel_tok_emb + vel_pos_emb`, etc.), not by zero-initialization. $S_0$ is initialized to all-ones.
+- **Two-optimizer training.** All learned per-layer scalars (the `*_raw` parameters) are trained by AdamW at a higher LR ($3 \cdot 10^{-3}$) than the rest of the network. Matrix weights use **Muon**; embeddings, LayerNorm, and scalars use **AdamW**.
+- **Weight tying** with `tok_emb` for the output projection in every variant.
 
 ### Common design notes
 
