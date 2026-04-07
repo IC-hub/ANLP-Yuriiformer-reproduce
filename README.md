@@ -24,6 +24,110 @@ This repo implements and compares 6 such variants under matched compute and iden
 
 ---
 
+## Per-Variant Architecture & Update Equations
+
+All variants share the same backbone: 12 layers, 12 heads, d_model 768, GPT-2 BPE tokenizer (50304 vocab), causal self-attention + 4× MLP, weight-tied output head, pre-norm.  They differ **only** in the per-layer block update rule (and, where present, in the auxiliary streams that are propagated alongside the hidden state `x`).
+
+The two oracles in every block are:
+
+```
+g_attn(x) = Attn(LN(x))         # attention "gradient"
+g_mlp(x)  = MLP(LN(x))          # MLP "gradient"
+```
+
+Each block performs **two substeps** (Lie–Trotter splitting): first an attention substep, then an MLP substep.  Below, every per-layer scalar (`μ`, `β`, `γ`, `ν`, `λ`) is **learned**, parameterized through `sigmoid` (for values in (0,1)) or `softplus` (for positives).  Subscripts `a`/`m` denote attention vs. MLP substep parameters.
+
+### 1. `VanillaTransformer` — GD + Lie–Trotter
+
+Standard pre-norm nanoGPT-style block.  No auxiliary stream, no learned scalars.
+
+```
+x ← x + g_attn(x)
+x ← x + g_mlp(x)
+```
+
+This is one step of **gradient descent** with unit step size on the composite objective `f_attn + f_mlp`, split via Lie–Trotter.  The "gradients" are the oracle outputs themselves (the model never computes a real loss gradient — the layer **is** the gradient step).
+
+### 2. `YuriiFormer` — Nesterov + Lie–Trotter
+
+Maintains a parallel **velocity** stream `v`, initialized from a separate (learned) velocity embedding.  6 learned scalars per layer.
+
+```
+# Attention substep
+x_eval = x + μ_a · v                       # Nesterov lookahead
+v      ← LN_v(β_a · v + γ_a · g_attn(x_eval))
+x      ← x + v                             # iterate update (step size fixed at 1)
+
+# MLP substep
+x_eval = x + μ_m · v
+v      ← LN_v(β_m · v + γ_m · g_mlp(x_eval))
+x      ← x + v
+```
+
+This is one step of **Nesterov accelerated gradient** per substep: gradient is evaluated at the lookahead point `x + μ·v`, the velocity is an EMA of past gradients, and the iterate moves by the full velocity.
+
+### 3. `TMMFormer` — Triple Momentum Method + Lie–Trotter
+
+Strict generalization of YuriiFormer: adds a second learned scalar `ν` that decouples the iterate update from the gradient lookahead.  8 learned scalars per layer.
+
+```
+# Attention substep
+x_eval = x + μ_a · v                       # gradient lookahead
+v      ← LN_v(β_a · v + γ_a · g_attn(x_eval))
+x      ← x + ν_a · v                       # iterate update (TMM allows ν ≠ 1)
+
+# MLP substep
+x_eval = x + μ_m · v
+v      ← LN_v(β_m · v + γ_m · g_mlp(x_eval))
+x      ← x + ν_m · v
+```
+
+The classical **Triple Momentum Method** (Van Scoy et al. 2018) is the first-order optimal algorithm for L-smooth, μ-strongly convex functions, with rate `(1 − √(μ/L))²` — strictly faster than Nesterov's `(1 − √(μ/L))`.  YuriiFormer is the special case `ν ≡ 1`.  `ν` is initialized via `softplus(0.5413) ≈ 1.0` so training starts from the YuriiFormer regime.
+
+### 4. `AdamFormer` — Adam + Lie–Trotter
+
+Maintains **two** auxiliary streams: a first moment `m` (initialized from a learned embedding) and a second moment `s` (initialized to 1).  6 learned scalars per layer.
+
+```
+# Attention substep
+g      = g_attn(x)
+m      ← β1_a · m + (1 − β1_a) · g                  # 1st moment EMA
+s      ← β2_a · s + (1 − β2_a) · g²                 # 2nd moment EMA (elementwise)
+x      ← x + γ_a · LN_u( m / (√s + ε) )
+
+# MLP substep (same structure with g = g_mlp(x))
+m      ← β1_m · m + (1 − β1_m) · g
+s      ← β2_m · s + (1 − β2_m) · g²
+x      ← x + γ_m · LN_u( m / (√s + ε) )
+```
+
+This is one step of **Adam** per substep: 1st/2nd moment EMAs are propagated forward, and the iterate moves along the per-coordinate normalized direction `m/√s`.  An extra `LN_u` normalizes the adaptive update to keep magnitudes stable across layers.
+
+### 5. `AdamWFormer` — AdamW + Lie–Trotter
+
+Same auxiliary streams and update direction as AdamFormer, but with **decoupled weight decay** on the iterate.  8 learned scalars per layer (adds `λ_a`, `λ_m`).
+
+```
+# Attention substep
+g      = g_attn(x)
+m      ← β1_a · m + (1 − β1_a) · g
+s      ← β2_a · s + (1 − β2_a) · g²
+x      ← (1 − λ_a) · x + γ_a · LN_u( m / (√s + ε) )    # decoupled decay
+
+# MLP substep (analogous, with λ_m)
+```
+
+`λ_*` are initialized via `sigmoid(−5) ≈ 0.007`, so AdamWFormer starts very close to AdamFormer and learns the optimal per-layer decay.  This mirrors AdamW vs. Adam: pulling the iterate slightly toward zero before applying the adaptive update.
+
+### Common design notes
+
+- **`LN_v` / `LN_u`** (LayerNorm on the velocity / adaptive-update tensor) is borrowed from YuriiFormer.  It dramatically stabilizes the auxiliary stream — without it, momentum-style architectures diverge after a few hundred steps.
+- **Auxiliary stream initialization.**  Velocity `v` and 1st-moment `m` are produced by *separate learned embeddings* (`vel_tok_emb + vel_pos_emb`, etc.), not by zero-initialization.  The 2nd moment `s` is initialized to ones.
+- **Two-optimizer setup.**  All learned per-layer scalars (the `*_raw` parameters) go through AdamW with a higher LR (`3e-3`) than the rest of the network.  Matrix weights use **Muon**, embeddings/LN/scalars use **AdamW**.
+- **Weight tying** with `tok_emb` for the output projection in every variant.
+
+---
+
 ## Results
 
 ### TinyStories (10k steps, effective batch ≈ 480, single seed)
