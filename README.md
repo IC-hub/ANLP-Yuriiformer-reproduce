@@ -15,8 +15,8 @@ This repo implements and compares 6 such variants under matched compute and iden
 | `VanillaTransformer` | GD | Lie–Trotter | no | 0 | 124M |
 | `YuriiFormer` | Nesterov | Lie–Trotter | yes | 6 (μ,β,γ × 2) | 163M |
 | `TMMFormer` | Triple Momentum Method | Lie–Trotter | yes | 8 (μ,β,γ,ν × 2) | 163M |
-| `AdamFormer` | Adam (1st/2nd moment) | Lie–Trotter | yes (m, v) | 0 | ~140M |
-| `AdamWFormer` | AdamW (decoupled wd) | Lie–Trotter | yes (m, v) | 0 | ~140M |
+| `AdamFormer` | Adam (1st/2nd moment) | Lie–Trotter | yes (m, s) | 6 (β₁,β₂,γ × 2) | ~163M |
+| `AdamWFormer` | AdamW (decoupled wd) | Lie–Trotter | yes (m, s) | 8 (β₁,β₂,γ,λ × 2) | ~163M |
 
 **Triple Momentum Method (TMM)** is the first-order optimal algorithm for L-smooth, μ-strongly convex functions (Van Scoy et al. 2018), with convergence rate (1−√(μ/L))² — strictly better than Nesterov. `TMMFormer` generalizes `YuriiFormer` by adding a learnable scalar `ν` that decouples the iterate update from the gradient-evaluation lookahead.
 
