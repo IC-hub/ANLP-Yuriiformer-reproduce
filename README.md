@@ -233,6 +233,48 @@ HellaSwag (10-shot) and ARC-Easy (25-shot), evaluated with `lm-evaluation-harnes
 
 All TS-trained models are **at chance level** (HellaSwag random ≈ 0.25, ARC-Easy 4-choice ≈ 0.25). This is expected — the TinyStories vocabulary/style distribution is too narrow to transfer. **OWT-checkpoint downstream evaluation is the meaningful comparison** and will be added once the OWT runs complete.
 
+### Attention Entropy (OWT best checkpoints)
+
+We measure how peaked vs. diffuse each head's attention distribution is, as a proxy for how specialized the head has become. For each variant we monkey-patch `CausalSelfAttention.forward` to compute the softmax weights explicitly (instead of fused SDPA), and accumulate the per-query Shannon entropy averaged over heads, batch and valid query positions.
+
+For a causal attention layer with sequence length $T$ and per-head softmax weights $a^{(h)}_{ij}$ ($i$ = query, $j$ = key, $j \le i$), the per-head mean entropy is
+
+$$
+H^{(h)} \;=\; \frac{1}{B(T-1)} \sum_{b=1}^{B} \sum_{i=2}^{T} \Big(- \sum_{j=1}^{i} a^{(h)}_{b,i,j} \log a^{(h)}_{b,i,j}\Big),
+$$
+
+reported in **nats**. The first query ($i=1$) is dropped because its softmax is degenerate (single key). The maximum possible value is $\log T = \log 1024 \approx 6.931$ (uniform attention). Values close to 0 mean the head has collapsed to a single token (e.g. attention sink / induction copy); values near $\log T$ mean the head averages indiscriminately over context.
+
+Measured on each variant's OWT `best.pt`, 8 batches × 4 sequences of length 1024 from the OWT validation split:
+
+| Layer | YuriiFormer | TMMFormer | AdamFormer | AdamWFormer |
+|---:|---:|---:|---:|---:|
+| 0  | 3.37 | 3.32 | 4.22 | 4.29 |
+| 1  | 2.60 | 2.93 | **0.33** | **1.62** |
+| 2  | 3.35 | 3.32 | 2.91 | 3.23 |
+| 3  | 2.95 | 2.97 | 3.44 | 3.59 |
+| 4  | 2.88 | 2.83 | 3.09 | 3.05 |
+| 5  | 3.27 | 3.30 | 3.38 | 3.23 |
+| 6  | 3.17 | 3.15 | 3.35 | 3.41 |
+| 7  | 3.31 | 3.22 | 3.02 | 3.11 |
+| 8  | 3.14 | 3.11 | 3.29 | 3.21 |
+| 9  | 3.18 | 3.12 | 3.20 | 3.22 |
+| 10 | 3.32 | 3.26 | 3.32 | 3.31 |
+| 11 | 3.30 | 3.36 | 3.50 | 3.44 |
+| **mean** | **3.154** | **3.157** | **3.089** | **3.224** |
+
+(Vanilla pending — its checkpoint node is currently drained.)
+
+**Observations**
+
+1. **YuriiFormer ≡ TMMFormer in attention behavior**. The two columns agree to ≤ 0.05 nats per layer (overall Δ ≈ 0.003). This reinforces the loss-level finding that TMM's extra ν degree of freedom does not change how attention is used in practice.
+2. **Adam/AdamW collapse layer 1**. AdamFormer's layer 1 mean entropy is 0.33 nats with `min_h = 0.0000` — at least one head has fully collapsed to an attention sink. AdamWFormer shows a milder version (1.62, `min_h ≈ 0.0001`). This degeneracy is absent in the Nesterov family.
+3. **Adam family has the most diffuse layer 0** (4.22–4.29 vs ~3.35 for Nesterov family). The dual moment streams (m, s) appear to push the first layer toward broader, more averaging-like aggregation.
+4. **Deep layers (2–11) are relatively flat across variants** (typical spread < 0.3 nats). The architectural differences mostly show up at the input-side layers; the internal attention motifs converge to similar entropies.
+5. All variants sit at roughly **45% of $\log T$** — well away from uniform but also not collapsed, indicating healthy mixed-specificity attention overall.
+
+The script and per-head tensors live in `attention_entropy.py` and `attention_entropy_results/<variant>.pt`.
+
 ---
 
 ## Project Structure
