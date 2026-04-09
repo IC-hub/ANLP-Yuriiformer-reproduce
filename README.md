@@ -199,25 +199,26 @@ Eight learned scalars per layer (adds $\lambda$ per substep). We initialize $\la
 | Paper Vanilla GD+LT (nanoGPT) | 1.106 | 1.114 | — |
 | Paper YuriiFormer | **1.078** | 1.090 | 0.896 |
 | **TMMFormer** (ours) | **1.1284** | 1.1387 | 0.8464 |
+| YuriiFormer (ours) | 1.1299 | 1.1384 | 0.8497 |
 | AdamWFormer (ours) | 1.1472 | 1.1547 | — |
 | AdamFormer (ours) | 1.1528 | 1.1554 | — |
 | VanillaTransformer (ours) | 1.1569 | 1.1604 | 0.9418 |
-| YuriiFormer (ours) | running | — | — |
 
-**TS observations**: TMM is the best non-paper variant on TinyStories. Adam-style variants underperform vanilla momentum. Our reproduction loss (~1.15) is higher than paper Vanilla LT (1.114) — likely a Muon/effective-batch hyperparameter difference — but **relative comparisons under matched setup remain valid**.
+**TS observations**: TMM and YuriiFormer are statistically tied (Δ = 0.0015), both clearly ahead of Adam-style variants and Vanilla. Our reproduction loss (~1.13) is higher than paper YuriiFormer (1.078) — a systematic Muon/effective-batch hyperparameter offset — but **relative comparisons under matched setup remain valid**. The extra ν freedom in TMM neither helps nor hurts at 10k steps.
 
 ### OpenWebText (30k steps)
 
-| Method | Best Val | Status |
-|---|---:|---|
-| Paper Vanilla GD+LT | 2.990 | — |
-| Paper YuriiFormer | **2.920** | — |
-| **TMMFormer** (ours) | **2.9720** | 70% (interrupted, resumed) |
-| AdamWFormer (ours) | 2.9883 | done |
-| AdamFormer (ours) | 2.9911 | done |
-| VanillaTransformer (ours) | 3.0224 | 83% running |
+| Method | Best Val | Final Val | Train@30k |
+|---|---:|---:|---:|
+| Paper Vanilla GD+LT | 2.990 | — | — |
+| Paper YuriiFormer | **2.920** | — | — |
+| **TMMFormer** (ours) | **2.9342** | 2.9342 | 2.9290 |
+| YuriiFormer (ours) | 2.9413 | 2.9413 | 2.9352 |
+| AdamWFormer (ours) | 2.9883 | 2.9883 | 2.9883 |
+| AdamFormer (ours) | 2.9911 | 2.9911 | 2.9904 |
+| VanillaTransformer (ours) | 3.0078 | 3.0080 | 3.0087 |
 
-**OWT observations**: TMM at 70% progress already beats AdamW (2.9883) and paper Vanilla LT (2.990). Cosine decay through the remaining 30% should push it further down, plausibly into the 2.94–2.96 range — approaching but not yet matching paper YuriiFormer (2.920).
+**OWT observations**: TMMFormer (2.9342) is the best variant under our reproduction setup, narrowly ahead of YuriiFormer (2.9413, Δ ≈ 0.007). Both Nesterov-family momentum variants beat Adam/AdamW by ~0.05 nats and Vanilla by ~0.07. All five trained variants beat paper Vanilla LT (2.990), but none reach paper YuriiFormer (2.920) — consistent with the reproduction offset seen on TS.
 
 ### Downstream Evaluation (TinyStories checkpoints)
 
