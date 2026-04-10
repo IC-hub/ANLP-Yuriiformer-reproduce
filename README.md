@@ -24,6 +24,10 @@ This repo implements and compares 8 such variants under matched compute and iden
 
 **Adam/AdamW variants** maintain per-token first/second moment streams alongside the hidden state, mirroring the Adam optimizer applied to embeddings. They underperform momentum-based variants — confirming that token-space gradients lack the per-dimension scale variance that makes Adam useful for parameter optimization.
 
+**Muon** (Jordan et al. 2024) performs steepest descent under the spectral (operator) norm by orthogonalizing the momentum buffer via Newton-Schulz iterations, producing updates with all singular values ≈ 1. `MuonFormer` tests whether **isotropic updates** — where no singular direction dominates — help or hinder token-embedding optimization. It has the fewest learned scalars (4/layer) of any auxiliary-stream variant.
+
+**SOAP** (Vyas et al. 2024) extends Shampoo with Adam-style adaptivity in the Kronecker-factored eigenbasis. `SOAPFormer` uses a **right-factor-only** design: the right covariance $R_t \in \mathbb{R}^{d \times d}$ captures cross-dimension correlations (which no other component models), while the left factor is redundant with attention's cross-position role. The matrix inverse square root $R_t^{-1/2}$ is approximated via Newton-Schulz, sharing infrastructure with MuonFormer.
+
 ---
 
 ## From Optimizers to Transformer Architectures
