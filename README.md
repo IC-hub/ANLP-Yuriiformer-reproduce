@@ -2,9 +2,9 @@
 
 A from-scratch reproduction of **YuriiFormer** (Nesterov + Lie–Trotter) plus a systematic comparison of additional optimizer-inspired transformer variants on TinyStories and OpenWebText, with downstream evaluation on HellaSwag and ARC-Easy.
 
-The core idea: a pre-norm transformer layer can be interpreted as **one iteration of an optimization algorithm on token embeddings**, with attention and MLP acting as two oracles. Different choices of optimizer (GD, Nesterov, Triple Momentum Method, Adam-style preconditioning) and operator-splitting scheme (Euler, Lie–Trotter, Strang) give rise to different transformer architectures.
+The core idea: a pre-norm transformer layer can be interpreted as **one iteration of an optimization algorithm on token embeddings**, with attention and MLP acting as two oracles. Different choices of optimizer (GD, Nesterov, Triple Momentum Method, Adam-style preconditioning, Muon orthogonalized momentum, SOAP Kronecker preconditioning) and operator-splitting scheme (Euler, Lie–Trotter, Strang) give rise to different transformer architectures.
 
-This repo implements and compares 6 such variants under matched compute and identical training pipelines.
+This repo implements and compares 8 such variants under matched compute and identical training pipelines.
 
 ---
 
@@ -17,6 +17,8 @@ This repo implements and compares 6 such variants under matched compute and iden
 | `TMMFormer` | Triple Momentum Method | Lie–Trotter | yes | 8 (μ,β,γ,ν × 2) | 163M |
 | `AdamFormer` | Adam (1st/2nd moment) | Lie–Trotter | yes (m, s) | 6 (β₁,β₂,γ × 2) | ~163M |
 | `AdamWFormer` | AdamW (decoupled wd) | Lie–Trotter | yes (m, s) | 8 (β₁,β₂,γ,λ × 2) | ~163M |
+| `MuonFormer` | Muon (orthogonalized momentum) | Lie–Trotter | yes (m) | 4 (β,γ × 2) | ~163M |
+| `SOAPFormer` | SOAP (Kronecker-preconditioned) | Lie–Trotter | yes (m, R) | 6 (β₁,β_R,γ × 2) | ~170M |
 
 **Triple Momentum Method (TMM)** is the first-order optimal algorithm for L-smooth, μ-strongly convex functions (Van Scoy et al. 2018), with convergence rate (1−√(μ/L))² — strictly better than Nesterov. `TMMFormer` generalizes `YuriiFormer` by adding a learnable scalar `ν` that decouples the iterate update from the gradient-evaluation lookahead.
 
@@ -36,7 +38,7 @@ $$\nabla \mathcal{E}_t(X) \;\approx\; \mathrm{Attn}_t\!\bigl(\mathrm{LN}(X)\bigr
 
 A first-order optimization template applied to $\mathcal{E} + \mathcal{F}$ via **Lie–Trotter splitting** then yields a transformer block: each layer performs an attention substep (gradient step on $\mathcal{E}$) followed by an MLP substep (gradient step on $\mathcal{F}$). Different optimizer templates → different transformer architectures.
 
-All five variants share the same 12L/12H/$d=768$ pre-norm backbone, GPT-2 BPE tokenizer, and weight-tied output head — they differ **only** in the optimizer template and in the auxiliary streams ($V_t$, $M_t$, $S_t$) propagated alongside the state $X_t$. Per-layer scalars ($\mu, \beta, \gamma, \nu, \lambda$) are all learned, reparameterized through $\sigma$ for $(0,1)$ values or $\mathrm{softplus}$ for positives.
+All seven variants share the same 12L/12H/$d=768$ pre-norm backbone, GPT-2 BPE tokenizer, and weight-tied output head — they differ **only** in the optimizer template and in the auxiliary streams ($V_t$, $M_t$, $S_t$, $R_t$) propagated alongside the state $X_t$. Per-layer scalars ($\mu, \beta, \gamma, \nu, \lambda$) are all learned, reparameterized through $\sigma$ for $(0,1)$ values or $\mathrm{softplus}$ for positives.
 
 ---
 
@@ -174,18 +176,98 @@ Eight learned scalars per layer (adds $\lambda$ per substep). We initialize $\la
 
 ---
 
+### 6. `MuonFormer` — Muon (Orthogonalized Momentum)
+
+**Optimizer (Jordan et al., 2024).** Muon performs steepest descent under the **spectral (operator) norm** rather than the Frobenius/L2 norm. It maintains a momentum buffer, then extracts the **orthogonal polar factor** via Newton-Schulz (NS) iterations — producing an update whose singular values are all 1:
+
+$$
+\begin{aligned}
+m_{t+1} &\;=\; \beta_t\, m_t + (1 - \beta_t)\, \nabla f(x_t) & &\text{(momentum EMA)}\\
+U_{t+1} &\;=\; \mathrm{NS}_K\!\bigl(m_{t+1}\bigr) & &\text{(orthogonalize via Newton-Schulz)}\\
+x_{t+1} &\;=\; x_t - \gamma_t\, U_{t+1} & &\text{(iterate update)}
+\end{aligned}
+$$
+
+where $\mathrm{NS}_K$ denotes $K$ iterations of the quintic Newton-Schulz recurrence applied to the Frobenius-normalized momentum:
+
+$$
+\begin{aligned}
+Y_0 &\;=\; m / \|m\|_F \\
+Y_{k+1} &\;=\; Y_k \bigl(a I + b\, Y_k^\top Y_k + c\, (Y_k^\top Y_k)^2\bigr), \qquad k = 0, \dots, K-1
+\end{aligned}
+$$
+
+with quintic coefficients $a = 3.4445$, $b = -4.7750$, $c = 2.0315$. After $K \approx 5$ iterations, $Y_K$ approximates the orthogonal polar factor of $m$ (all singular values $\approx 1$). This makes the update **isotropic** — no singular direction dominates, regardless of the gradient spectrum.
+
+**Transformer.** Maintain a momentum stream $M_t$ (from a separate learned embedding) alongside $X_t$. Each layer applies the Muon template twice (Lie–Trotter):
+
+$$
+\begin{aligned}
+G^{\text{a}}_t &\;=\; \mathrm{Attn}_t(\mathrm{LN}(X_t)) \\
+M_{t+\frac{1}{2}} &\;=\; \beta_t\, M_t + (1 - \beta_t)\, G^{\text{a}}_t \\
+X_{t+\frac{1}{2}} &\;=\; X_t + \gamma_t\, \mathrm{LN}_u\!\bigl(\mathrm{NS}_K(M_{t+\frac{1}{2}})\bigr) \\[6pt]
+G^{\text{m}}_t &\;=\; \mathrm{MLP}_t(\mathrm{LN}(X_{t+\frac{1}{2}})) \\
+M_{t+1} &\;=\; \beta_{t+\frac{1}{2}}\, M_{t+\frac{1}{2}} + (1 - \beta_{t+\frac{1}{2}})\, G^{\text{m}}_t \\
+X_{t+1} &\;=\; X_{t+\frac{1}{2}} + \gamma_{t+\frac{1}{2}}\, \mathrm{LN}_u\!\bigl(\mathrm{NS}_K(M_{t+1})\bigr)
+\end{aligned}
+$$
+
+Four learned scalars per layer ($\beta, \gamma$ per substep). $\beta \in (0,1)$ via sigmoid, $\gamma > 0$ via softplus. The Newton-Schulz iteration count $K = 5$ is a fixed hyperparameter.
+
+**Computational note.** Each NS iteration involves $Y^\top Y$ ($d \times d$ matmul) and right-multiplication, costing $O(T \cdot d^2)$ per iteration. With $K = 5$ iterations per substep, 2 substeps per layer, the overhead is $O(10 \cdot T \cdot d^2)$ per layer — comparable to the MLP cost and smaller than attention's $O(T^2 \cdot d)$.
+
+**Hypothesis.** The forced isotropy of the Muon update may prevent the attention collapse seen in AdamFormer (layer 1 entropy 0.33 nats), since no singular direction in the update can dominate. On the other hand, it may suppress beneficial anisotropy that helps specialization.
+
+---
+
+### 7. `SOAPFormer` — SOAP (Kronecker-Preconditioned Adam)
+
+**Optimizer (Vyas et al., 2024).** SOAP extends Shampoo by applying Adam-style adaptivity in the eigenbasis of the Kronecker-factored gradient covariance. For a matrix iterate $X \in \mathbb{R}^{T \times d}$, full SOAP tracks both a left covariance $L_t \in \mathbb{R}^{T \times T}$ and a right covariance $R_t \in \mathbb{R}^{d \times d}$, then eigendecomposes both to form a preconditioned update.
+
+**Right-factor-only variant.** We drop the left factor $L_t$ (which is $T \times T = 1024 \times 1024$ — expensive to eigendecompose at every layer) and keep only the right covariance $R_t \in \mathbb{R}^{d \times d}$. This captures cross-dimension correlations in the "gradient" signal, while cross-position interactions are already handled by attention. The matrix inverse square root $R_t^{-1/2}$ is approximated via **Newton-Schulz iterations** (same routine as MuonFormer), avoiding explicit eigendecomposition:
+
+$$
+\begin{aligned}
+g_t &\;=\; \nabla f(x_t) \\
+m_{t+1} &\;=\; \beta_{1,t}\, m_t + (1 - \beta_{1,t})\, g_t & &\text{(first moment EMA)}\\
+R_{t+1} &\;=\; \beta_{R,t}\, R_t + (1 - \beta_{R,t})\, g_t^\top g_t & &\text{(right covariance EMA, } d \times d\text{)}\\
+x_{t+1} &\;=\; x_t - \gamma_t\, m_{t+1}\, R_{t+1}^{-1/2} & &\text{(preconditioned update)}
+\end{aligned}
+$$
+
+**Transformer.** Maintain a first-moment stream $M_t \in \mathbb{R}^{T \times d}$ (from a learned embedding) and a right-covariance stream $R_t \in \mathbb{R}^{d \times d}$ (initialized to identity) alongside $X_t$. Each layer applies the SOAP template twice (Lie–Trotter):
+
+$$
+\begin{aligned}
+G^{\text{a}}_t &\;=\; \mathrm{Attn}_t(\mathrm{LN}(X_t)) \\
+M_{t+\frac{1}{2}} &\;=\; \beta_{1,t}\, M_t + (1 - \beta_{1,t})\, G^{\text{a}}_t \\
+R_{t+\frac{1}{2}} &\;=\; \beta_{R,t}\, R_t + (1 - \beta_{R,t})\, (G^{\text{a}}_t)^\top G^{\text{a}}_t \\
+X_{t+\frac{1}{2}} &\;=\; X_t + \gamma_t\, \mathrm{LN}_u\!\bigl(M_{t+\frac{1}{2}}\, \mathrm{NS}^{-1/2}_K(R_{t+\frac{1}{2}})\bigr) \\[6pt]
+G^{\text{m}}_t &\;=\; \mathrm{MLP}_t(\mathrm{LN}(X_{t+\frac{1}{2}})) \\
+M_{t+1} &\;=\; \beta_{1,t+\frac{1}{2}}\, M_{t+\frac{1}{2}} + (1 - \beta_{1,t+\frac{1}{2}})\, G^{\text{m}}_t \\
+R_{t+1} &\;=\; \beta_{R,t+\frac{1}{2}}\, R_{t+\frac{1}{2}} + (1 - \beta_{R,t+\frac{1}{2}})\, (G^{\text{m}}_t)^\top G^{\text{m}}_t \\
+X_{t+1} &\;=\; X_{t+\frac{1}{2}} + \gamma_{t+\frac{1}{2}}\, \mathrm{LN}_u\!\bigl(M_{t+1}\, \mathrm{NS}^{-1/2}_K(R_{t+1})\bigr)
+\end{aligned}
+$$
+
+where $\mathrm{NS}^{-1/2}_K(R)$ denotes $K$ Newton-Schulz iterations approximating $R^{-1/2}$.
+
+Six learned scalars per layer ($\beta_1, \beta_R, \gamma$ per substep). $\beta_1, \beta_R \in (0,1)$ via sigmoid, $\gamma > 0$ via softplus. $R_0 = I_d$ (identity); $M_0$ from learned embeddings.
+
+**Why right-factor only?** The left covariance $L_t \in \mathbb{R}^{T \times T}$ captures cross-position correlations — but attention already provides exactly this. The right covariance $R_t \in \mathbb{R}^{d \times d}$ captures cross-dimension correlations, which no other component models. This asymmetry makes the right-factor-only variant both efficient and non-redundant.
+
+**Parameters.** The $R_t$ covariance stream adds $12 \times d^2 = 12 \times 768^2 \approx 7\text{M}$ state elements (not trained — evolved per-layer), bringing the total to ~170M.
+
+**Why SOAP over Shampoo?** Both share the same expensive component (Kronecker covariance tracking + matrix inverse square root). SOAP adds Adam-style first-moment tracking in the preconditioned space — cheap (element-wise) but strictly better for convergence, since it provides per-direction adaptivity that raw Shampoo lacks.
+
+---
+
 ### Common design notes
 
-- **Velocity / update LayerNorm.** $\mathrm{LN}_v$ (in YuriiFormer / TMMFormer) and $\mathrm{LN}_u$ (in AdamFormer / AdamWFormer) are essential for stability across depth: without them, momentum-based architectures diverge after a few hundred steps.
-- **Auxiliary stream initialization.** $V_0$ and $M_0$ are produced by *separate learned embeddings* (`vel_tok_emb + vel_pos_emb`, etc.), not by zero-initialization. $S_0$ is initialized to all-ones.
+- **Velocity / update LayerNorm.** $\mathrm{LN}_v$ (in YuriiFormer / TMMFormer) and $\mathrm{LN}_u$ (in AdamFormer / AdamWFormer / MuonFormer / SOAPFormer) are essential for stability across depth: without them, momentum-based architectures diverge after a few hundred steps.
+- **Auxiliary stream initialization.** $V_0$ and $M_0$ are produced by *separate learned embeddings* (`vel_tok_emb + vel_pos_emb`, etc.), not by zero-initialization. $S_0$ is initialized to all-ones. $R_0$ (SOAPFormer's right covariance) is initialized to identity.
+- **Newton-Schulz iterations.** MuonFormer and SOAPFormer both use $K = 5$ iterations of the quintic Newton-Schulz recurrence — for polar-factor extraction (MuonFormer) and matrix inverse square root (SOAPFormer), respectively.
 - **Two-optimizer training.** All learned per-layer scalars (the `*_raw` parameters) are trained by AdamW at a higher LR ($3 \cdot 10^{-3}$) than the rest of the network. Matrix weights use **Muon**; embeddings, LayerNorm, and scalars use **AdamW**.
-- **Weight tying** with `tok_emb` for the output projection in every variant.
-
-### Common design notes
-
-- **`LN_v` / `LN_u`** (LayerNorm on the velocity / adaptive-update tensor) is borrowed from YuriiFormer.  It dramatically stabilizes the auxiliary stream — without it, momentum-style architectures diverge after a few hundred steps.
-- **Auxiliary stream initialization.**  Velocity `v` and 1st-moment `m` are produced by *separate learned embeddings* (`vel_tok_emb + vel_pos_emb`, etc.), not by zero-initialization.  The 2nd moment `s` is initialized to ones.
-- **Two-optimizer setup.**  All learned per-layer scalars (the `*_raw` parameters) go through AdamW with a higher LR (`3e-3`) than the rest of the network.  Matrix weights use **Muon**, embeddings/LN/scalars use **AdamW**.
 - **Weight tying** with `tok_emb` for the output projection in every variant.
 
 ---
