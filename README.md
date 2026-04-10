@@ -420,6 +420,8 @@ HellaSwag (10-shot) and ARC-Easy (25-shot), evaluated with `lm-evaluation-harnes
 ├── vanilla_model.py          # VanillaTransformer (GD + Lie–Trotter, no velocity)
 ├── adam_model.py             # AdamFormer (Adam-style m,v streams)
 ├── adamw_model.py            # AdamWFormer (decoupled weight decay variant)
+├── muon_model.py             # MuonFormer (orthogonalized momentum via Newton-Schulz)
+├── soap_model.py             # SOAPFormer (right-factor Kronecker-preconditioned Adam)
 │
 ├── data.py                   # TinyStories tokenization (GPT-2 BPE) + dataloader
 ├── data_owt.py               # OpenWebText tokenization + streaming dataloader
@@ -430,6 +432,8 @@ HellaSwag (10-shot) and ARC-Easy (25-shot), evaluated with `lm-evaluation-harnes
 ├── vanilla_train_ddp.py      # DDP VanillaTransformer (TinyStories)
 ├── adam_train_ddp.py         # DDP AdamFormer (TinyStories)
 ├── adamw_train_ddp.py        # DDP AdamWFormer (TinyStories)
+├── muon_train_ddp.py         # DDP MuonFormer (TinyStories)
+├── soap_train_ddp.py         # DDP SOAPFormer (TinyStories)
 │
 ├── tmm_train_owt.py          # TMMFormer OpenWebText trainer (DDP)
 ├── vanilla_train_owt.py      # VanillaTransformer OWT trainer
@@ -447,7 +451,9 @@ HellaSwag (10-shot) and ARC-Easy (25-shot), evaluated with `lm-evaluation-harnes
 ├── adam_eval_run.py          # AdamFormer eval driver
 ├── adamw_eval_run.py         # AdamWFormer eval driver
 │
+├── smoke_test.py             # Quick pipeline validation for new variants
 ├── *_train_preempt.sbatch    # Preemption-aware DDP training jobs (TinyStories, debug, 2 GPU)
+├── *_train_2gpu.sbatch       # Full training jobs (general partition, 2 GPU, 48h)
 ├── *_train_owt.sbatch        # OWT training jobs (general partition, 2 GPU, ~28h)
 ├── *_eval.sbatch             # Single-GPU downstream evaluation jobs
 │
@@ -457,7 +463,7 @@ HellaSwag (10-shot) and ARC-Easy (25-shot), evaluated with `lm-evaluation-harnes
 
 ### Code structure conventions
 
-- **`*_model.py`** — model definition. All variants share a common pre-norm interface: `forward(x: LongTensor[B,T]) -> Float[B,T,V]`. Velocity-bearing variants (TMM/Yurii/Adam) maintain a parallel `v` (and for Adam also `m_2`) state initialized from a separate embedding and updated layer-by-layer.
+- **`*_model.py`** — model definition. All variants share a common pre-norm interface: `forward(x: LongTensor[B,T]) -> Float[B,T,V]`. Auxiliary-stream variants maintain parallel state initialized from separate embeddings and updated layer-by-layer: velocity `v` (TMM/Yurii), moments `m, s` (Adam/AdamW), momentum `m` (Muon), or first moment `m` + right covariance `R` (SOAP).
 
 - **`*_train_ddp.py`** — DDP training script. Identical structure across variants:
   - 12L/12H/768d small config
