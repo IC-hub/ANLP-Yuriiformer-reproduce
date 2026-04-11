@@ -19,29 +19,42 @@ from model import CausalSelfAttention, MLP
 _NS_A, _NS_B, _NS_C = 3.4445, -4.7750, 2.0315
 
 
-def newton_schulz(M: torch.Tensor, K: int = 5) -> torch.Tensor:
-    """Approximate the orthogonal polar factor of M via Newton-Schulz.
+def newton_schulz_per_token(M: torch.Tensor, n_heads: int, K: int = 5) -> torch.Tensor:
+    """Per-token head-wise Newton-Schulz orthogonalization.
 
-    Given M ∈ R^{B×T×d}, returns Y ≈ U where M = U S is the polar
-    decomposition.  After K iterations every singular value of Y is ≈ 1.
+    Each token's d-dim representation is reshaped as an (n_heads, head_dim)
+    matrix, and the quintic Newton-Schulz polar-factor iteration is applied
+    independently to each token's matrix.  This is causal by construction
+    (no cross-token mixing) and orthogonalizes the per-head contributions
+    within each token.
+
+    For a short-and-fat matrix M[t] ∈ R^{n_heads × head_dim} with
+    n_heads < head_dim, the polar factor has n_heads orthonormal rows in
+    the head_dim subspace — every head gets a unit-norm, mutually orthogonal
+    update within the token.
 
     Args:
-        M: input tensor of shape (B, T, d)
+        M: input tensor of shape (B, T, d) where d = n_heads * head_dim
+        n_heads: number of heads to factor d into
         K: number of quintic Newton-Schulz iterations (default 5)
 
     Returns:
-        Y: tensor of same shape with approximate orthogonal polar factor
+        tensor of shape (B, T, d) with per-token head-space orthogonalized updates
     """
-    # Frobenius-normalize across the (T, d) matrix for each batch element
-    norm = M.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-12)
-    Y = M / norm
+    B, T, d = M.shape
+    head_dim = d // n_heads
+    # Reshape each token's d-dim vector as an (n_heads, head_dim) matrix
+    Y = M.view(B, T, n_heads, head_dim)
+    # Per-token Frobenius normalization (over the 2D sub-matrix axes)
+    norm = Y.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-12)
+    Y = Y / norm
 
-    I = torch.eye(Y.shape[-1], device=Y.device, dtype=Y.dtype)
+    I = torch.eye(head_dim, device=Y.device, dtype=Y.dtype)
     for _ in range(K):
-        A = Y.transpose(-2, -1) @ Y          # (B, d, d)
-        Y = Y @ (_NS_A * I + _NS_B * A + _NS_C * A @ A)  # (B, T, d)
+        A = Y.transpose(-2, -1) @ Y          # (B, T, head_dim, head_dim)
+        Y = Y @ (_NS_A * I + _NS_B * A + _NS_C * A @ A)  # (B, T, n_heads, head_dim)
 
-    return Y
+    return Y.reshape(B, T, d)
 
 
 # ── MuonFormer block ──────────────────────────────────────────────────────
@@ -51,13 +64,19 @@ class MuonLTBlock(nn.Module):
 
     Per-substep (attention, then MLP):
         g     = Oracle(LN(x))
-        m_new = beta * m + (1 - beta) * g        (momentum EMA)
-        u     = NS_K(m_new)                       (orthogonalize)
-        x_new = x + gamma * LN_u(u)              (state update)
+        m_new = beta * m + (1 - beta) * g                    (momentum EMA)
+        u     = NS_K(m_new as (n_heads, head_dim) per token)  (head-wise orthogonalize)
+        x_new = x + gamma * LN_u(u)                          (state update)
+
+    The Newton-Schulz step is applied to each token's (n_heads, head_dim)
+    matrix independently — making the operation causal and giving each
+    attention head a unit-norm, mutually-orthogonal contribution to the
+    token's update.
     """
 
     def __init__(self, d_model: int, n_heads: int, ns_iters: int = 5):
         super().__init__()
+        self.n_heads = n_heads
         self.ns_iters = ns_iters
 
         # Pre-norm for oracles
@@ -88,13 +107,13 @@ class MuonLTBlock(nn.Module):
         # ── Attention substep ───────────────────────────────────────────
         g_attn = self.attn(self.ln_attn(x))
         m_half = beta_a * m + (1 - beta_a) * g_attn
-        u_attn = newton_schulz(m_half, K=self.ns_iters)
+        u_attn = newton_schulz_per_token(m_half, self.n_heads, K=self.ns_iters)
         x_half = x + gamma_a * self.ln_update_attn(u_attn)
 
         # ── MLP substep ─────────────────────────────────────────────────
         g_mlp = self.mlp(self.ln_mlp(x_half))
         m_next = beta_m * m_half + (1 - beta_m) * g_mlp
-        u_mlp = newton_schulz(m_next, K=self.ns_iters)
+        u_mlp = newton_schulz_per_token(m_next, self.n_heads, K=self.ns_iters)
         x_next = x_half + gamma_m * self.ln_update_mlp(u_mlp)
 
         return x_next, m_next
