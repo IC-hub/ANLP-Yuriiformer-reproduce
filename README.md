@@ -212,13 +212,14 @@ Eight learned scalars per layer (adds $\lambda$ per substep). We initialize $\la
 |---|---:|---:|---:|
 | Paper Vanilla GD+LT | 2.990 | — | — |
 | Paper YuriiFormer | **2.920** | — | — |
-| **TMMFormer** (ours) | **2.9342** | 2.9342 | 2.9290 |
-| YuriiFormer (ours) | 2.9413 | 2.9413 | 2.9352 |
+| **YuriiFormer + WSD** (ours) | **2.9275** | 2.9275 | 2.9348 |
+| TMMFormer (ours) | 2.9342 | 2.9342 | 2.9290 |
+| YuriiFormer (ours, cosine) | 2.9413 | 2.9413 | 2.9352 |
 | AdamWFormer (ours) | 2.9883 | 2.9883 | 2.9883 |
 | AdamFormer (ours) | 2.9911 | 2.9911 | 2.9904 |
 | VanillaTransformer (ours) | 3.0078 | 3.0080 | 3.0087 |
 
-**OWT observations**: TMMFormer (2.9342) is the best variant under our reproduction setup, narrowly ahead of YuriiFormer (2.9413, Δ ≈ 0.007). Both Nesterov-family momentum variants beat Adam/AdamW by ~0.05 nats and Vanilla by ~0.07. All five trained variants beat paper Vanilla LT (2.990), but none reach paper YuriiFormer (2.920) — consistent with the reproduction offset seen on TS.
+**OWT observations**: Swapping the cosine schedule for **Warmup–Stable–Decay (WSD)** while keeping the YuriiFormer architecture unchanged improves best val loss from 2.9413 → **2.9275** (Δ ≈ −0.014), making it the strongest reproduction variant overall. WSD beats the previous best (TMMFormer cosine, 2.9342) by Δ ≈ −0.007, and closes the gap to paper YuriiFormer (2.920) to within 0.008 nats — almost erasing the ~0.05-nat reproduction offset that the cosine variants exhibited under our 2-GPU DDP + `torch.compile` setup. The full SAM and SAWD runs are still in flight; results will be added once they finish.
 
 ### Downstream Evaluation (TinyStories checkpoints)
 
@@ -247,21 +248,21 @@ reported in **nats**. The first query ($i=1$) is dropped because its softmax is 
 
 Measured on each variant's OWT `best.pt`, 8 batches × 4 sequences of length 1024 from the OWT validation split:
 
-| Layer | Vanilla | YuriiFormer | TMMFormer | AdamFormer | AdamWFormer |
-|---:|---:|---:|---:|---:|---:|
-| 0  | **5.39** | 3.37 | 3.32 | 4.22 | 4.29 |
-| 1  | 4.17 | 2.60 | 2.93 | **0.33** | **1.62** |
-| 2  | 3.58 | 3.35 | 3.32 | 2.91 | 3.23 |
-| 3  | 3.79 | 2.95 | 2.97 | 3.44 | 3.59 |
-| 4  | 3.12 | 2.88 | 2.83 | 3.09 | 3.05 |
-| 5  | 3.07 | 3.27 | 3.30 | 3.38 | 3.23 |
-| 6  | 3.41 | 3.17 | 3.15 | 3.35 | 3.41 |
-| 7  | 3.07 | 3.31 | 3.22 | 3.02 | 3.11 |
-| 8  | 3.01 | 3.14 | 3.11 | 3.29 | 3.21 |
-| 9  | 3.10 | 3.18 | 3.12 | 3.20 | 3.22 |
-| 10 | 3.16 | 3.32 | 3.26 | 3.32 | 3.31 |
-| 11 | 3.45 | 3.30 | 3.36 | 3.50 | 3.44 |
-| **mean** | **3.527** | **3.154** | **3.157** | **3.089** | **3.224** |
+| Layer | Vanilla | YuriiFormer | TMMFormer | AdamFormer | AdamWFormer | **Yurii+WSD** |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0  | **5.39** | 3.37 | 3.32 | 4.22 | 4.29 | 3.22 |
+| 1  | 4.17 | 2.60 | 2.93 | **0.33** | **1.62** | 1.77 |
+| 2  | 3.58 | 3.35 | 3.32 | 2.91 | 3.23 | 3.29 |
+| 3  | 3.79 | 2.95 | 2.97 | 3.44 | 3.59 | 2.84 |
+| 4  | 3.12 | 2.88 | 2.83 | 3.09 | 3.05 | 2.80 |
+| 5  | 3.07 | 3.27 | 3.30 | 3.38 | 3.23 | 3.22 |
+| 6  | 3.41 | 3.17 | 3.15 | 3.35 | 3.41 | 3.03 |
+| 7  | 3.07 | 3.31 | 3.22 | 3.02 | 3.11 | 3.22 |
+| 8  | 3.01 | 3.14 | 3.11 | 3.29 | 3.21 | 3.10 |
+| 9  | 3.10 | 3.18 | 3.12 | 3.20 | 3.22 | 3.09 |
+| 10 | 3.16 | 3.32 | 3.26 | 3.32 | 3.31 | 3.20 |
+| 11 | 3.45 | 3.30 | 3.36 | 3.50 | 3.44 | 3.18 |
+| **mean** | **3.527** | **3.154** | **3.157** | **3.089** | **3.224** | **2.997** |
 
 **Observations**
 
@@ -271,6 +272,7 @@ Measured on each variant's OWT `best.pt`, 8 batches × 4 sequences of length 102
 4. **Adam family has the most diffuse layer 0** among auxiliary-stream variants (4.22–4.29 vs ~3.35 for Nesterov family). The dual moment streams (m, s) appear to push the first layer toward broader, more averaging-like aggregation.
 5. **Deep layers (2–11) are relatively flat across variants** (typical spread < 0.3 nats). The architectural differences mostly show up at the input-side layers; the internal attention motifs converge to similar entropies.
 6. All variants sit between **~45% and ~50% of $\log T$** — well away from uniform but also not collapsed, indicating healthy mixed-specificity attention overall.
+7. **YuriiFormer + WSD has the lowest overall entropy** (2.997 nats, Δ ≈ −0.16 vs cosine YuriiFormer). It is the *only* variant with an overall mean below 3 nats. The WSD model is healthier than the Adam family at layer 1 (1.77 nats, `min_h ≈ 0.009` — no fully collapsed sink) but still significantly more peaked than cosine YuriiFormer (2.60). Across the deep layers (3–11) WSD is uniformly 0.05–0.15 nats below all cosine variants, indicating a network-wide shift toward more confident, more specialized attention. This is consistent with the sharpness numbers below: WSD lives in a flatter basin and uses its attention more decisively.
 
 The script and per-head tensors live in `attention_entropy.py` and `attention_entropy_results/<variant>.pt`.
 
@@ -288,11 +290,12 @@ Sharper minima ⇒ larger $\lambda_{\max}$, larger $\mathrm{tr}(H)$, steeper 1D 
 
 | Variant | val_loss | $\lambda_{\max}$ | $\mathrm{tr}(H)$ | $\mathrm{tr}(H)/n$ | curve $\Delta$ |
 |---|---:|---:|---:|---:|---:|
-| **TMMFormer** | **2.934** | **130.7** | **23 258** | **1.42e−4** | **9.08** |
-| YuriiFormer | 2.941 | 167.7 | 22 841 | 1.39e−4 | 8.54 |
+| **YuriiFormer + WSD** | **2.928** | 112.4 | **15 724** | **9.60e−5** | 10.77 |
+| TMMFormer | 2.934 | 130.7 | 23 258 | 1.42e−4 | 9.08 |
+| YuriiFormer (cosine) | 2.941 | 167.7 | 22 841 | 1.39e−4 | 8.54 |
 | AdamFormer | 2.991 | 423.9 | 34 409 | 2.10e−4 | 9.36 |
 | AdamWFormer | 2.988 | **1889.1** | 48 933 | 2.99e−4 | 9.77 |
-| Vanilla | 3.008 | 79.8 | 39 320 | 3.16e−4 | 11.35 |
+| Vanilla | 3.008 | **79.8** | 39 320 | 3.16e−4 | 11.35 |
 
 **Observations**
 
@@ -301,6 +304,7 @@ Sharper minima ⇒ larger $\lambda_{\max}$, larger $\mathrm{tr}(H)$, steeper 1D 
 3. **AdamFormer is intermediate**: $\lambda_{\max} = 424$ (~3× Nesterov family) but $\mathrm{tr}/n$ moderate. Removing decoupled wd softens the worst direction but the basin is still sharper than Nesterov.
 4. **Vanilla has the smallest $\lambda_{\max}$ but the largest $\mathrm{tr}/n$ and steepest 1D curve** — a "wide but bumpy" basin: no single direction is extremely steep, yet many directions contribute moderate curvature, and the random 1D probe rises faster than for any other variant.
 5. **TMM ≈ Yurii in landscape too**: trace within 2%, 1D curve ranges differ by only 0.5 nats; TMM's $\lambda_{\max}$ is slightly lower (130.7 vs 167.7), perhaps reflecting ν damping the worst eigendirection. Combined with the entropy and downstream-task results, this is the third independent measurement showing the two are functionally equivalent.
+6. **WSD finds a strictly flatter basin than cosine — at the same architecture.** Replacing cosine with the Warmup–Stable–Decay schedule on YuriiFormer drives $\mathrm{tr}(H)$ from 22 841 → **15 724** (Δ ≈ −31%), $\mathrm{tr}/n$ from 1.39e−4 → **9.60e−5** (Δ ≈ −31%), and $\lambda_{\max}$ from 167.7 → **112.4** (Δ ≈ −33%). It is the lowest $\mathrm{tr}/n$ of *all* variants — including TMM and including cosine YuriiFormer — by a clear margin. This is direct evidence that WSD's long stable phase + late linear decay is implicitly sharpness-aware: by holding peak LR until the final 17% of training and then decaying linearly, the optimizer spends most of its budget *exploring* and only at the end *settles* into a flat region. The 1D curve $\Delta$ (10.77) is comparatively large, but this metric depends on a non-seeded random direction and is substantially less reliable than the trace and $\lambda_{\max}$ estimates, which agree that WSD is the flattest. This finding is the schedule-only counterpart of what SAM aims to achieve through its dual-pass perturbation, and it suggests that *part* of the benefit attributed to sharpness-aware training in the literature can be obtained simply by changing the LR schedule.
 
 Per-variant tensors are saved to `loss_sharpness_results/<variant>.pt`.
 

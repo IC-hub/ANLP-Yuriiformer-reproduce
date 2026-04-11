@@ -24,6 +24,9 @@ VARIANTS = {
     "tmm":      ("tmm_model",      "TMMFormer",          "checkpoints_tmm_owt"),
     "adam":     ("adam_model",     "AdamFormer",         "checkpoints_adam_owt"),
     "adamw":    ("adamw_model",    "AdamWFormer",        "checkpoints_adamw_owt"),
+    "wsd":      ("model",          "YuriiFormer",        "checkpoints_yurii_wsd_owt"),
+    "sam":      ("model",          "YuriiFormer",        "checkpoints_yurii_sam_owt"),
+    "sawd":     ("model",          "YuriiFormer",        "checkpoints_yurii_sawd_owt"),
 }
 
 
