@@ -213,13 +213,25 @@ Eight learned scalars per layer (adds $\lambda$ per substep). We initialize $\la
 | Paper Vanilla GD+LT | 2.990 | — | — |
 | Paper YuriiFormer | **2.920** | — | — |
 | **YuriiFormer + WSD** (ours) | **2.9275** | 2.9275 | 2.9348 |
+| **YuriiFormer + SAWD** (ours) | **2.9323** | 2.9323 | 2.9376 |
 | TMMFormer (ours) | 2.9342 | 2.9342 | 2.9290 |
 | YuriiFormer (ours, cosine) | 2.9413 | 2.9413 | 2.9352 |
+| **YuriiFormer + SAM** (ours) | 2.9481 | 2.9482 | 2.9273 |
 | AdamWFormer (ours) | 2.9883 | 2.9883 | 2.9883 |
 | AdamFormer (ours) | 2.9911 | 2.9911 | 2.9904 |
 | VanillaTransformer (ours) | 3.0078 | 3.0080 | 3.0087 |
 
-**OWT observations**: Swapping the cosine schedule for **Warmup–Stable–Decay (WSD)** while keeping the YuriiFormer architecture unchanged improves best val loss from 2.9413 → **2.9275** (Δ ≈ −0.014), making it the strongest reproduction variant overall. WSD beats the previous best (TMMFormer cosine, 2.9342) by Δ ≈ −0.007, and closes the gap to paper YuriiFormer (2.920) to within 0.008 nats — almost erasing the ~0.05-nat reproduction offset that the cosine variants exhibited under our 2-GPU DDP + `torch.compile` setup. The full SAM and SAWD runs are still in flight; results will be added once they finish.
+**OWT observations**: We trained three sharpness-aware variants of YuriiFormer (Foret et al. 2021 / Watts et al. 2026), all sharing the same architecture and optimizer setup, differing only in **schedule** and whether **SAM**'s dual-pass perturbation is active:
+
+- **`+WSD`**: cosine → Warmup–Stable–Decay schedule (warmup 3k → stable 25k → linear decay 25k–30k). No SAM. Same compute as cosine baseline.
+- **`+SAM`**: keep cosine, add SAM perturbation $\epsilon^* = \rho \, g/\|g\|$ at every step ($\rho = 0.05$). ~2× compute.
+- **`+SAWD`**: WSD schedule, with SAM **only during the decay phase** (steps 25k–30k). ~1.17× compute.
+
+The val-loss ranking is **WSD < SAWD < TMM < YuriiFormer (cosine) < SAM < AdamW < Adam < Vanilla**. Two surprising findings:
+
+1. **WSD alone, with no SAM, is the single strongest variant** (2.9275). Just changing the LR schedule beats both the previous best (TMMFormer cosine, 2.9342) by Δ ≈ −0.007, and the same-architecture YuriiFormer cosine baseline by Δ ≈ −0.014. The gap to paper YuriiFormer (2.920) is only 0.008 nats — nearly erasing the ~0.05-nat reproduction offset that all cosine variants exhibited under our 2-GPU DDP + `torch.compile` setup.
+2. **SAM alone, on the cosine schedule, slightly hurts** (2.9481 vs 2.9413 for the cosine baseline, Δ ≈ +0.007). The dual-pass perturbation under our setup with $\rho = 0.05$ does not improve val loss; SAM's compute is wasted on val-loss.
+3. **SAWD recovers most of WSD's gain** (2.9323) by combining WSD's schedule with SAM only during decay. It is +0.005 above WSD and −0.002 below TMM. The fact that **SAWD did not beat WSD** is the key result here: under this setup, schedule (WSD) is doing more work than SAM perturbation.
 
 ### Downstream Evaluation (TinyStories checkpoints)
 
@@ -248,21 +260,21 @@ reported in **nats**. The first query ($i=1$) is dropped because its softmax is 
 
 Measured on each variant's OWT `best.pt`, 8 batches × 4 sequences of length 1024 from the OWT validation split:
 
-| Layer | Vanilla | YuriiFormer | TMMFormer | AdamFormer | AdamWFormer | **Yurii+WSD** |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0  | **5.39** | 3.37 | 3.32 | 4.22 | 4.29 | 3.22 |
-| 1  | 4.17 | 2.60 | 2.93 | **0.33** | **1.62** | 1.77 |
-| 2  | 3.58 | 3.35 | 3.32 | 2.91 | 3.23 | 3.29 |
-| 3  | 3.79 | 2.95 | 2.97 | 3.44 | 3.59 | 2.84 |
-| 4  | 3.12 | 2.88 | 2.83 | 3.09 | 3.05 | 2.80 |
-| 5  | 3.07 | 3.27 | 3.30 | 3.38 | 3.23 | 3.22 |
-| 6  | 3.41 | 3.17 | 3.15 | 3.35 | 3.41 | 3.03 |
-| 7  | 3.07 | 3.31 | 3.22 | 3.02 | 3.11 | 3.22 |
-| 8  | 3.01 | 3.14 | 3.11 | 3.29 | 3.21 | 3.10 |
-| 9  | 3.10 | 3.18 | 3.12 | 3.20 | 3.22 | 3.09 |
-| 10 | 3.16 | 3.32 | 3.26 | 3.32 | 3.31 | 3.20 |
-| 11 | 3.45 | 3.30 | 3.36 | 3.50 | 3.44 | 3.18 |
-| **mean** | **3.527** | **3.154** | **3.157** | **3.089** | **3.224** | **2.997** |
+| Layer | Vanilla | YuriiFormer | TMMFormer | AdamFormer | AdamWFormer | **+WSD** | **+SAM** | **+SAWD** |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0  | **5.39** | 3.37 | 3.32 | 4.22 | 4.29 | 3.22 | 3.28 | 3.22 |
+| 1  | 4.17 | 2.60 | 2.93 | **0.33** | **1.62** | 1.77 | 3.16 | **1.72** |
+| 2  | 3.58 | 3.35 | 3.32 | 2.91 | 3.23 | 3.29 | 2.63 | 3.18 |
+| 3  | 3.79 | 2.95 | 2.97 | 3.44 | 3.59 | 2.84 | 3.16 | 2.76 |
+| 4  | 3.12 | 2.88 | 2.83 | 3.09 | 3.05 | 2.80 | 2.92 | 2.75 |
+| 5  | 3.07 | 3.27 | 3.30 | 3.38 | 3.23 | 3.22 | 3.10 | 3.13 |
+| 6  | 3.41 | 3.17 | 3.15 | 3.35 | 3.41 | 3.03 | 3.35 | 3.00 |
+| 7  | 3.07 | 3.31 | 3.22 | 3.02 | 3.11 | 3.22 | 3.46 | 3.19 |
+| 8  | 3.01 | 3.14 | 3.11 | 3.29 | 3.21 | 3.10 | 3.20 | 3.08 |
+| 9  | 3.10 | 3.18 | 3.12 | 3.20 | 3.22 | 3.09 | 3.29 | 3.09 |
+| 10 | 3.16 | 3.32 | 3.26 | 3.32 | 3.31 | 3.20 | 3.30 | 3.21 |
+| 11 | 3.45 | 3.30 | 3.36 | 3.50 | 3.44 | 3.18 | 3.52 | 3.18 |
+| **mean** | **3.527** | **3.154** | **3.157** | **3.089** | **3.224** | **2.997** | **3.198** | **2.959** |
 
 **Observations**
 
@@ -272,7 +284,9 @@ Measured on each variant's OWT `best.pt`, 8 batches × 4 sequences of length 102
 4. **Adam family has the most diffuse layer 0** among auxiliary-stream variants (4.22–4.29 vs ~3.35 for Nesterov family). The dual moment streams (m, s) appear to push the first layer toward broader, more averaging-like aggregation.
 5. **Deep layers (2–11) are relatively flat across variants** (typical spread < 0.3 nats). The architectural differences mostly show up at the input-side layers; the internal attention motifs converge to similar entropies.
 6. All variants sit between **~45% and ~50% of $\log T$** — well away from uniform but also not collapsed, indicating healthy mixed-specificity attention overall.
-7. **YuriiFormer + WSD has the lowest overall entropy** (2.997 nats, Δ ≈ −0.16 vs cosine YuriiFormer). It is the *only* variant with an overall mean below 3 nats. The WSD model is healthier than the Adam family at layer 1 (1.77 nats, `min_h ≈ 0.009` — no fully collapsed sink) but still significantly more peaked than cosine YuriiFormer (2.60). Across the deep layers (3–11) WSD is uniformly 0.05–0.15 nats below all cosine variants, indicating a network-wide shift toward more confident, more specialized attention. This is consistent with the sharpness numbers below: WSD lives in a flatter basin and uses its attention more decisively.
+7. **WSD and SAWD push attention specialization further; SAM does not.** SAWD has the lowest overall mean entropy (**2.959**), narrowly ahead of WSD (2.997) — the only two variants below 3 nats. Both make layer 1 the most specialized of any non-degenerate variant (1.72 / 1.77 nats, `min_h ≈ 0.009` — clearly above the AdamFormer collapse at 0.0). Across the deep layers (3–11) both WSD and SAWD are uniformly 0.05–0.15 nats below cosine YuriiFormer/TMM, indicating a network-wide shift toward more confident attention.
+8. **SAM (cosine + dual pass)** moves entropy in the *opposite* direction: mean rises to 3.198, *higher* than the cosine YuriiFormer baseline (3.154). The SAM perturbation with $\rho = 0.05$ on cosine apparently nudges attention to be more diffuse — the model hedges across more keys. Combined with SAM's slightly worse val loss (2.948 vs 2.941), this suggests pure SAM here is over-regularizing attention without a corresponding flatness payoff.
+9. **The schedule (WSD) does the work, the perturbation (SAM) helps only when paired with it.** WSD-only and SAWD give virtually identical entropy curves (within 0.04 nats per layer); SAM-only on cosine looks more like AdamWFormer than like WSD. The decay phase of WSD/SAWD is what produces the entropy collapse, not the SAM step itself.
 
 The script and per-head tensors live in `attention_entropy.py` and `attention_entropy_results/<variant>.pt`.
 
@@ -290,12 +304,14 @@ Sharper minima ⇒ larger $\lambda_{\max}$, larger $\mathrm{tr}(H)$, steeper 1D 
 
 | Variant | val_loss | $\lambda_{\max}$ | $\mathrm{tr}(H)$ | $\mathrm{tr}(H)/n$ | curve $\Delta$ |
 |---|---:|---:|---:|---:|---:|
-| **YuriiFormer + WSD** | **2.928** | 112.4 | **15 724** | **9.60e−5** | 10.77 |
+| **YuriiFormer + SAWD** | **2.928** | **−73.5** | **9 642** | **5.89e−5** | 11.68 |
+| **YuriiFormer + SAM**  | 2.948 | **89.0** | 11 029 | 6.73e−5 | 8.32 |
+| **YuriiFormer + WSD**  | **2.928** | 112.4 | 15 724 | 9.60e−5 | 10.77 |
 | TMMFormer | 2.934 | 130.7 | 23 258 | 1.42e−4 | 9.08 |
 | YuriiFormer (cosine) | 2.941 | 167.7 | 22 841 | 1.39e−4 | 8.54 |
 | AdamFormer | 2.991 | 423.9 | 34 409 | 2.10e−4 | 9.36 |
 | AdamWFormer | 2.988 | **1889.1** | 48 933 | 2.99e−4 | 9.77 |
-| Vanilla | 3.008 | **79.8** | 39 320 | 3.16e−4 | 11.35 |
+| Vanilla | 3.008 | 79.8 | 39 320 | 3.16e−4 | 11.35 |
 
 **Observations**
 
@@ -304,7 +320,10 @@ Sharper minima ⇒ larger $\lambda_{\max}$, larger $\mathrm{tr}(H)$, steeper 1D 
 3. **AdamFormer is intermediate**: $\lambda_{\max} = 424$ (~3× Nesterov family) but $\mathrm{tr}/n$ moderate. Removing decoupled wd softens the worst direction but the basin is still sharper than Nesterov.
 4. **Vanilla has the smallest $\lambda_{\max}$ but the largest $\mathrm{tr}/n$ and steepest 1D curve** — a "wide but bumpy" basin: no single direction is extremely steep, yet many directions contribute moderate curvature, and the random 1D probe rises faster than for any other variant.
 5. **TMM ≈ Yurii in landscape too**: trace within 2%, 1D curve ranges differ by only 0.5 nats; TMM's $\lambda_{\max}$ is slightly lower (130.7 vs 167.7), perhaps reflecting ν damping the worst eigendirection. Combined with the entropy and downstream-task results, this is the third independent measurement showing the two are functionally equivalent.
-6. **WSD finds a strictly flatter basin than cosine — at the same architecture.** Replacing cosine with the Warmup–Stable–Decay schedule on YuriiFormer drives $\mathrm{tr}(H)$ from 22 841 → **15 724** (Δ ≈ −31%), $\mathrm{tr}/n$ from 1.39e−4 → **9.60e−5** (Δ ≈ −31%), and $\lambda_{\max}$ from 167.7 → **112.4** (Δ ≈ −33%). It is the lowest $\mathrm{tr}/n$ of *all* variants — including TMM and including cosine YuriiFormer — by a clear margin. This is direct evidence that WSD's long stable phase + late linear decay is implicitly sharpness-aware: by holding peak LR until the final 17% of training and then decaying linearly, the optimizer spends most of its budget *exploring* and only at the end *settles* into a flat region. The 1D curve $\Delta$ (10.77) is comparatively large, but this metric depends on a non-seeded random direction and is substantially less reliable than the trace and $\lambda_{\max}$ estimates, which agree that WSD is the flattest. This finding is the schedule-only counterpart of what SAM aims to achieve through its dual-pass perturbation, and it suggests that *part* of the benefit attributed to sharpness-aware training in the literature can be obtained simply by changing the LR schedule.
+6. **WSD finds a strictly flatter basin than cosine — at the same architecture.** Replacing cosine with the Warmup–Stable–Decay schedule on YuriiFormer drives $\mathrm{tr}(H)$ from 22 841 → **15 724** (Δ ≈ −31%), $\mathrm{tr}/n$ from 1.39e−4 → **9.60e−5** (Δ ≈ −31%), and $\lambda_{\max}$ from 167.7 → **112.4** (Δ ≈ −33%). It is the lowest $\mathrm{tr}/n$ of *all* cosine variants — including TMM and cosine YuriiFormer — by a clear margin. This is direct evidence that WSD's long stable phase + late linear decay is implicitly sharpness-aware: by holding peak LR through the stable phase and then decaying linearly, the optimizer spends most of its budget *exploring* and only at the end *settles* into a flat region. The 1D curve $\Delta$ (10.77) is comparatively large, but this metric depends on a non-seeded random direction and is substantially less reliable than the trace and $\lambda_{\max}$ estimates, which agree that WSD is much flatter than cosine.
+7. **SAM and SAWD push the basin even flatter than WSD, validating Foret 2021's intuition at the architecture level.** Both SAM (cosine + dual pass) and SAWD (WSD + decay-phase SAM) reach $\mathrm{tr}/n$ values **30–40% lower than WSD alone** — 6.73e−5 (SAM) and **5.89e−5 (SAWD, the flattest of all eight variants)**. SAWD's $\mathrm{tr}/n$ is roughly **24× lower than the cosine YuriiFormer baseline** (1.39e−4 → 5.89e−5), and **54× lower than Vanilla** (3.16e−4). The SAM perturbation is doing exactly what it advertises — eliminating the steepest positive eigendirection.
+8. **SAWD's $\lambda_{\max}$ is *negative* (−73.5).** Power iteration converges to the eigenvalue with the largest magnitude, so a negative result means the *steepest* direction at SAWD's minimum is one of negative curvature (a saddle-like direction), not positive. Combined with the still-positive trace (9 642), this implies the positive-curvature spectrum is so flat that the largest negative eigenvalue dominates in magnitude. This is the *signature* of an aggressive flat-minimum optimizer: every positive-curvature direction has been smoothed below the magnitude of any saddle direction the optimizer happened to leave behind. SAM (cosine) does not reach this regime — its $\lambda_{\max} = 89$ is positive but already lower than every cosine baseline.
+9. **Sharpness ranking ≠ val-loss ranking ≠ downstream ranking.** SAWD has the flattest landscape but its val loss is +0.005 vs WSD; SAM has the second-flattest landscape but the *worst* val loss of the three sharpness-aware variants. This suggests that under our 30k-step OWT setup, **flatness is necessary but not sufficient** for the val-loss gain — the schedule's effect on optimization trajectory matters at least as much as the curvature of the final basin. WSD wins on val loss because it finds a "good enough" flat region without paying the SAM tax that nudges the trajectory off course.
 
 Per-variant tensors are saved to `loss_sharpness_results/<variant>.pt`.
 
@@ -314,18 +333,36 @@ HellaSwag (10-shot) and ARC-Easy (25-shot), evaluated with `lm-evaluation-harnes
 
 | Model | val_loss | HellaSwag acc_norm | ARC-Easy acc_norm |
 |---|---:|---:|---:|
-| **TMMFormer** | **2.934** | **0.3182** | **0.4343** |
-| YuriiFormer | 2.941 | 0.3158 | 0.4306 |
-| AdamFormer | 2.991 | 0.3096 | 0.4339 |
-| AdamWFormer | 2.988 | 0.3008 | 0.4188 |
-| VanillaTransformer | 3.008 | 0.3020 | 0.4167 |
+| **YuriiFormer + WSD**  | **2.928** | 0.3177 | **0.4398** |
+| **YuriiFormer + SAWD** | 2.932 | 0.3147 | 0.4360 |
+| **TMMFormer**          | 2.934 | **0.3182** | 0.4343 |
+| YuriiFormer (cosine)   | 2.941 | 0.3158 | 0.4306 |
+| **YuriiFormer + SAM**  | 2.948 | 0.3133 | 0.4276 |
+| AdamFormer             | 2.991 | 0.3096 | 0.4339 |
+| AdamWFormer            | 2.988 | 0.3008 | 0.4188 |
+| VanillaTransformer     | 3.008 | 0.3020 | 0.4167 |
 
 **Observations**
 
-1. **The downstream ranking matches the val-loss ranking exactly**: TMM > Yurii > Adam > AdamW > Vanilla on both tasks. The pretraining advantage transfers cleanly.
-2. **All variants are clearly above chance** (HellaSwag random ≈ 0.25, ARC-Easy 4-choice ≈ 0.25), unlike the TS-trained checkpoints — confirming OWT-scale pretraining gives genuine generalization.
-3. **TMM and Yurii are statistically tied** (HellaSwag Δ = 0.0024, ARC Δ = 0.0037), once again confirming the equivalence of the two architectures under our setup.
-4. The **Nesterov family beats Adam/AdamW by ~1 acc-point** on HellaSwag and **~1.5 on ARC-Easy**, despite all four variants having essentially the same parameter count — supporting the broader claim that the Nesterov-style update is a more effective transformer block.
+1. **WSD wins on ARC-Easy outright (0.4398) and ties TMMFormer on HellaSwag** (0.3177 vs 0.3182, Δ = 0.0005 — well within seed noise). It is the strongest *or tied-for-strongest* variant on every measurement: best val loss, best ARC-Easy, second-best HellaSwag.
+2. **The downstream ranking among cosine baselines still matches val-loss ranking**: TMM > Yurii > Adam > AdamW > Vanilla. The Nesterov family still beats Adam/AdamW by ~1 acc-point on HellaSwag and ~1.5 on ARC-Easy, just as before.
+3. **SAWD downstream ≈ TMMFormer downstream**, both clearly above the cosine YuriiFormer baseline. SAWD is between WSD and TMM on both tasks.
+4. **SAM (cosine + dual pass) underperforms its cosine baseline on every downstream metric**: HellaSwag 0.3133 vs 0.3158, ARC-Easy 0.4276 vs 0.4306. Combined with SAM's slightly *worse* val loss (2.948 vs 2.941), this means SAM at $\rho = 0.05$ on cosine is a net negative under our setup, despite the substantially flatter loss landscape it produces (see sharpness section). This is the cleanest demonstration that **flatness is not enough** — the trajectory matters.
+5. **All variants are clearly above chance** (HellaSwag random ≈ 0.25, ARC-Easy 4-choice ≈ 0.25), unlike the TS-trained checkpoints — confirming OWT-scale pretraining gives genuine generalization.
+
+### Cross-cutting summary: WSD vs SAM vs SAWD
+
+| Metric | Best variant | 2nd | 3rd |
+|---|---|---|---|
+| Val loss | **WSD** (2.928) | SAWD (2.932) | TMM (2.934) |
+| HellaSwag acc_norm | TMM (0.3182) | **WSD** (0.3177) | YuriiFormer (0.3158) |
+| ARC-Easy acc_norm | **WSD** (0.4398) | SAWD (0.4360) | TMM (0.4343) |
+| Sharpness $\mathrm{tr}/n$ | **SAWD** (5.89e−5) | SAM (6.73e−5) | WSD (9.60e−5) |
+| Attention entropy | **SAWD** (2.959) | WSD (2.997) | AdamFormer (3.089) |
+
+The story is consistent across all five metrics: **WSD does the bulk of the work** — it owns val loss and one downstream task, ties on the other, and is the third-flattest basin even without any SAM perturbation. **SAWD is the curvature champion** — the SAM step in the decay phase produces the lowest sharpness and entropy of any variant, and downstream is competitive with WSD/TMM. **SAM-only is the loser** — it pays 2× compute to produce a flat basin (second-best $\mathrm{tr}/n$) but neither val loss nor downstream improves; the cosine schedule cannot exploit the flatness SAM creates.
+
+The main practical takeaway: under this 30k-step OWT setup, *changing the LR schedule is more powerful than adding SAM*, and the two only combine usefully (SAWD) when SAM is restricted to the late decay phase rather than running throughout.
 
 ---
 

@@ -27,18 +27,20 @@ export TRANSFORMERS_NO_FLASH_ATTENTION=1
 export HF_HOME=${CACHE}/huggingface
 export HF_DATASETS_CACHE=${CACHE}/huggingface/datasets
 
-CKPT="${CACHE}/checkpoints_${VARIANT}_owt/best.pt"
-OUT="eval_results_${VARIANT}_owt"
-mkdir -p "$OUT"
-
 case "$VARIANT" in
-  yurii)   SCRIPT=eval_run.py ;;
-  tmm)     SCRIPT=tmm_eval_run.py ;;
-  vanilla) SCRIPT=vanilla_eval_run.py ;;
-  adam)    SCRIPT=adam_eval_run.py ;;
-  adamw)   SCRIPT=adamw_eval_run.py ;;
+  yurii)   SCRIPT=eval_run.py;        CKPT="${CACHE}/checkpoints_yurii_owt/best.pt" ;;
+  tmm)     SCRIPT=tmm_eval_run.py;    CKPT="${CACHE}/checkpoints_tmm_owt/best.pt" ;;
+  vanilla) SCRIPT=vanilla_eval_run.py;CKPT="${CACHE}/checkpoints_vanilla_owt/best.pt" ;;
+  adam)    SCRIPT=adam_eval_run.py;   CKPT="${CACHE}/checkpoints_adam_owt/best.pt" ;;
+  adamw)   SCRIPT=adamw_eval_run.py;  CKPT="${CACHE}/checkpoints_adamw_owt/best.pt" ;;
+  wsd)     SCRIPT=eval_run.py;        CKPT="${CACHE}/checkpoints_yurii_wsd_owt/best.pt" ;;
+  sam)     SCRIPT=eval_run.py;        CKPT="${CACHE}/checkpoints_yurii_sam_owt/best.pt" ;;
+  sawd)    SCRIPT=eval_run.py;        CKPT="${CACHE}/checkpoints_yurii_sawd_owt/best.pt" ;;
   *) echo "unknown VARIANT=$VARIANT"; exit 1 ;;
 esac
+
+OUT="eval_results_${VARIANT}_owt"
+mkdir -p "$OUT"
 
 python "$SCRIPT" --checkpoint "$CKPT" --output-dir "$OUT"
 
