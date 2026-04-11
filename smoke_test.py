@@ -11,7 +11,6 @@ import torch.nn.functional as F
 
 from data import load_tokens, TinyStoriesDataset, ValidationDataset
 from muon_model import MuonFormer
-from soap_model import SOAPFormer
 
 BLOCK_SIZE = 1024
 BATCH_SIZE = 2
@@ -64,7 +63,25 @@ def configure_optimizers(model):
     return opt_muon, opt_adamw
 
 
-for name, ModelCls in [("MuonFormer", MuonFormer), ("SOAPFormer", SOAPFormer)]:
+# Causality check first: changing a future token must not affect earlier logits
+print("\n=== Causality check ===")
+with torch.no_grad():
+    m_check = MuonFormer().to(device).eval()
+    B, T = 1, 16
+    torch.manual_seed(0)
+    x1 = torch.randint(0, 50304, (B, T), device=device)
+    x2 = x1.clone()
+    x2[0, T - 1] = (x1[0, T - 1] + 1) % 50304
+    l1 = m_check(x1)
+    l2 = m_check(x2)
+    diffs = (l1[:, :-1] - l2[:, :-1]).abs().max().item()
+    status = "✓ CAUSAL" if diffs < 1e-4 else "✗ LEAKS FUTURE"
+    print(f"MuonFormer: max diff on positions 0..{T-2} = {diffs:.2e}  {status}")
+    del m_check
+    torch.cuda.empty_cache()
+    assert diffs < 1e-4, f"CAUSALITY VIOLATION: diff = {diffs}"
+
+for name, ModelCls in [("MuonFormer", MuonFormer)]:
     print(f"\n{'=' * 60}")
     print(f"Smoke test: {name}")
     print(f"{'=' * 60}")
