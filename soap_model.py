@@ -1,9 +1,14 @@
-"""SOAPFormer: Right-factor Kronecker-preconditioned Adam transformer architecture.
+"""SOAPFormer: Per-token head-wise Kronecker-preconditioned transformer.
 
-Each layer applies a right-factor-only SOAP template (first-moment EMA +
-right-covariance tracking + Newton-Schulz R^{-1/2} preconditioning) twice
-via Lie-Trotter splitting — once with the attention oracle and once with
-the MLP oracle.
+Each layer applies a SOAP-inspired template twice via Lie-Trotter splitting.
+The first moment and right covariance are tracked per-token in the
+(n_heads, head_dim) head space — causal by construction, with no cross-token
+or cross-batch mixing.
+
+The right covariance R[t] ∈ R^{head_dim × head_dim} captures cross-dimension
+correlations within each token's head space.  Preconditioning with R^{-1/2}
+(via eigendecomposition) decorrelates and equalizes per-head-dim update rates
+— the same advantage SOAP has over Adam, applied per-token.
 """
 
 import math
@@ -14,67 +19,65 @@ import torch.nn.functional as F
 from model import CausalSelfAttention, MLP
 
 
-# ── Newton-Schulz for matrix inverse square root ──────────────────────────
+# ── Per-token head-wise inverse square root ───────────────────────────────
 
-# Quintic coefficients (same as MuonFormer)
-_NS_A, _NS_B, _NS_C = 3.4445, -4.7750, 2.0315
+def newton_inv_sqrt(R: torch.Tensor, K: int = 10, eps: float = 1e-6) -> torch.Tensor:
+    """Compute R^{-1/2} via Newton's iteration for batched symmetric PD matrices.
 
-
-def newton_schulz_inv_sqrt(R: torch.Tensor, K: int = 5) -> torch.Tensor:
-    """Approximate R^{-1/2} for a symmetric PD matrix R via Newton-Schulz.
-
-    We compute the polar factor of R^{-1}: since R is symmetric PD,
-    its polar factor is R^{-1/2}.  We apply the quintic NS iteration
-    to the normalized R, then rescale.
+    Uses the iteration X_{k+1} = 0.5 * X_k * (3I - X_k @ R_norm @ X_k),
+    which converges to R_norm^{-1/2}.  This is purely matrix multiplications
+    — no eigendecomposition or SVD — so it handles degenerate eigenvalues
+    without issue.
 
     Args:
-        R: symmetric PD matrix of shape (d, d) or (B, d, d)
-        K: number of Newton-Schulz iterations (default 5)
+        R: symmetric PD tensor of shape (..., d, d)
+        K: number of Newton iterations (default 10)
+        eps: regularization added to diagonal
 
     Returns:
-        R_inv_sqrt: approximate R^{-1/2}, same shape as R
+        R_inv_sqrt: shape (..., d, d), approximating R^{-1/2}
     """
-    # Normalize by Frobenius norm for NS convergence
-    if R.dim() == 2:
-        norm = R.norm().clamp(min=1e-12)
-    else:
-        norm = R.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-12)
-    Y = R / norm
+    d = R.shape[-1]
+    I = torch.eye(d, device=R.device, dtype=R.dtype)
 
-    I = torch.eye(R.shape[-1], device=R.device, dtype=R.dtype)
+    # Regularize
+    R_reg = R + eps * I
+
+    # Normalize R so eigenvalues are near 1 for fast convergence
+    # Use Frobenius norm as a scale estimate
+    norm = R_reg.norm(dim=(-2, -1), keepdim=True).clamp(min=eps)
+    R_norm = R_reg / norm
+
+    # Newton iteration: X → 0.5 * X @ (3I - X @ R_norm @ X)
+    # Converges to R_norm^{-1/2} from X_0 = I
+    X = I.expand_as(R_norm).clone()
     for _ in range(K):
-        A = Y @ Y                              # Y^2 for symmetric Y
-        Y = Y @ (_NS_A * I + _NS_B * A + _NS_C * A @ A)
+        XRX = X @ R_norm @ X
+        X = 0.5 * X @ (3.0 * I - XRX)
 
-    # The NS iteration on R/||R|| converges to sign(R/||R||) = I for PD R.
-    # For the inverse square root, we use the relation:
-    #   If Y_K ≈ (R/||R||)^{-1/2}, then R^{-1/2} ≈ Y_K / sqrt(||R||).
-    # Re-derive: we want R^{-1/2}.  NS on normalized R gives polar factor
-    # of R/||R||, which for symmetric PD is (R/||R||)^{1/2} / ||(R/||R||)^{1/2}||.
-    # Instead, we directly apply NS to get an approximation and rescale.
-    if R.dim() == 2:
-        return Y / norm.sqrt()
-    else:
-        return Y / norm.sqrt()
+    # Undo normalization: R^{-1/2} = R_norm^{-1/2} / sqrt(norm)
+    return X / norm.sqrt()
 
 
 # ── SOAPFormer block ──────────────────────────────────────────────────────
 
 class SOAPLTBlock(nn.Module):
-    """SOAP+Lie-Trotter block with state/1st-moment/right-covariance streams.
+    """SOAP+Lie-Trotter block with per-token head-wise preconditioning.
 
     Per-substep (attention, then MLP):
-        g     = Oracle(LN(x))
-        m_new = beta1 * m + (1 - beta1) * g              (1st moment EMA)
-        R_new = betaR * R + (1 - betaR) * g^T @ g        (right covariance EMA)
-        u     = m_new @ NS_inv_sqrt(R_new)                (preconditioned update)
-        x_new = x + gamma * LN_u(u)                      (state update)
+        g     = Oracle(LN(x))                          (B, T, d)
+        G     = g.view(B, T, n_heads, head_dim)        reshape to head space
+        M_new = β₁ * M + (1 - β₁) * G                 1st moment EMA  (B, T, H, D)
+        R_new = β_R * R + (1 - β_R) * G^T @ G          right cov EMA   (B, T, D, D)
+        U     = M_new @ R_new^{-1/2}                   preconditioned   (B, T, H, D)
+        u     = LN_u(U.reshape(B, T, d))
+        x_new = x + γ * u                              state update
     """
 
-    def __init__(self, d_model: int, n_heads: int, ns_iters: int = 5):
+    def __init__(self, d_model: int, n_heads: int):
         super().__init__()
-        self.d_model = d_model
-        self.ns_iters = ns_iters
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
 
         # Pre-norm for oracles
         self.ln_attn = nn.LayerNorm(d_model, bias=False)
@@ -101,6 +104,14 @@ class SOAPLTBlock(nn.Module):
         m: torch.Tensor,
         R: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: hidden state     (B, T, d)
+            m: 1st moment       (B, T, n_heads, head_dim)
+            R: right covariance (B, T, head_dim, head_dim)
+        Returns:
+            (x_next, m_next, R_next) with same shapes
+        """
         beta1_a = torch.sigmoid(self.beta1_attn_raw)
         betaR_a = torch.sigmoid(self.betaR_attn_raw)
         gamma_a = F.softplus(self.gamma_attn_raw)
@@ -108,25 +119,33 @@ class SOAPLTBlock(nn.Module):
         betaR_m = torch.sigmoid(self.betaR_mlp_raw)
         gamma_m = F.softplus(self.gamma_mlp_raw)
 
+        B, T, d = x.shape
+        H, D = self.n_heads, self.head_dim
+
         # ── Attention substep ───────────────────────────────────────────
-        g_attn = self.attn(self.ln_attn(x))                   # (B, T, d)
-        m_half = beta1_a * m + (1 - beta1_a) * g_attn
-        # Right covariance update: g^T @ g averaged over batch
-        # g_attn is (B, T, d); g^T g gives (B, d, d), mean over batch → (d, d)
-        gTg_attn = (g_attn.transpose(-2, -1) @ g_attn).mean(dim=0)  # (d, d)
-        R_half = betaR_a * R + (1 - betaR_a) * gTg_attn
-        # Preconditioned update: m @ R^{-1/2}
-        R_inv_sqrt = newton_schulz_inv_sqrt(R_half, K=self.ns_iters)  # (d, d)
-        update_attn = self.ln_update_attn(m_half @ R_inv_sqrt)
+        g_attn = self.attn(self.ln_attn(x))                     # (B, T, d)
+        G_attn = g_attn.view(B, T, H, D)                        # (B, T, H, D)
+
+        m_half = beta1_a * m + (1 - beta1_a) * G_attn            # (B, T, H, D)
+        GtG_attn = G_attn.transpose(-2, -1) @ G_attn             # (B, T, D, D)
+        R_half = betaR_a * R + (1 - betaR_a) * GtG_attn          # (B, T, D, D)
+
+        R_inv_sqrt = newton_inv_sqrt(R_half)                        # (B, T, D, D)
+        U_attn = m_half @ R_inv_sqrt                              # (B, T, H, D)
+        update_attn = self.ln_update_attn(U_attn.reshape(B, T, d))
         x_half = x + gamma_a * update_attn
 
         # ── MLP substep ─────────────────────────────────────────────────
-        g_mlp = self.mlp(self.ln_mlp(x_half))                 # (B, T, d)
-        m_next = beta1_m * m_half + (1 - beta1_m) * g_mlp
-        gTg_mlp = (g_mlp.transpose(-2, -1) @ g_mlp).mean(dim=0)  # (d, d)
-        R_next = betaR_m * R_half + (1 - betaR_m) * gTg_mlp
-        R_inv_sqrt = newton_schulz_inv_sqrt(R_next, K=self.ns_iters)
-        update_mlp = self.ln_update_mlp(m_next @ R_inv_sqrt)
+        g_mlp = self.mlp(self.ln_mlp(x_half))                    # (B, T, d)
+        G_mlp = g_mlp.view(B, T, H, D)                           # (B, T, H, D)
+
+        m_next = beta1_m * m_half + (1 - beta1_m) * G_mlp        # (B, T, H, D)
+        GtG_mlp = G_mlp.transpose(-2, -1) @ G_mlp                # (B, T, D, D)
+        R_next = betaR_m * R_half + (1 - betaR_m) * GtG_mlp      # (B, T, D, D)
+
+        R_inv_sqrt = newton_inv_sqrt(R_next)                        # (B, T, D, D)
+        U_mlp = m_next @ R_inv_sqrt                               # (B, T, H, D)
+        update_mlp = self.ln_update_mlp(U_mlp.reshape(B, T, d))
         x_next = x_half + gamma_m * update_mlp
 
         return x_next, m_next, R_next
@@ -144,11 +163,12 @@ class SOAPFormer(nn.Module):
         n_layers: int = 12,
         n_heads: int = 12,
         max_seq_len: int = 1024,
-        ns_iters: int = 5,
     ):
         super().__init__()
         self.d_model = d_model
         self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
 
         # Main embeddings (state stream)
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -158,12 +178,12 @@ class SOAPFormer(nn.Module):
         self.m_tok_emb = nn.Embedding(vocab_size, d_model)
         self.m_pos_emb = nn.Embedding(max_seq_len, d_model)
 
-        # Right covariance R_0 = I_d (identity; not a learned parameter —
-        # it represents the initial assumption of isotropic gradient covariance)
+        # Right covariance R_0 = I_{head_dim} per token (identity;
+        # represents isotropic prior in head-dim space)
 
         # Transformer layers
         self.layers = nn.ModuleList(
-            [SOAPLTBlock(d_model, n_heads, ns_iters=ns_iters) for _ in range(n_layers)]
+            [SOAPLTBlock(d_model, n_heads) for _ in range(n_layers)]
         )
 
         # Final LayerNorm before output projection
@@ -199,10 +219,15 @@ class SOAPFormer(nn.Module):
         B, T = input_ids.shape
         pos = torch.arange(T, device=input_ids.device)
 
-        # Initialize state, 1st moment, and right covariance
+        # Initialize state, 1st moment (in head space), and right covariance
         x = self.tok_emb(input_ids) + self.pos_emb(pos)
-        m = self.m_tok_emb(input_ids) + self.m_pos_emb(pos)
-        R = torch.eye(self.d_model, device=input_ids.device, dtype=x.dtype)
+        m_flat = self.m_tok_emb(input_ids) + self.m_pos_emb(pos)
+        m = m_flat.view(B, T, self.n_heads, self.head_dim)
+
+        # R_0 = I_{head_dim} broadcast to (B, T, head_dim, head_dim)
+        R = torch.eye(
+            self.head_dim, device=input_ids.device, dtype=x.dtype
+        ).expand(B, T, -1, -1).contiguous()
 
         # Apply SOAP+Lie-Trotter layers
         for layer in self.layers:

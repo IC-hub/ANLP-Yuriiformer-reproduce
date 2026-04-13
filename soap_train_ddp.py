@@ -248,7 +248,7 @@ def main():
             "muon_momentum": MUON_MOMENTUM,
             "adam_betas": (ADAM_BETA1, ADAM_BETA2),
             "grad_clip": GRAD_CLIP,
-            "ns_iters": 5,
+            "newton_iters": 10,
             "resumed_from_step": start_step,
         }
         wandb.init(project="soapformer", config=config, resume="allow")

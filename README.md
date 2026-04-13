@@ -18,7 +18,7 @@ This repo implements and compares 8 such variants under matched compute and iden
 | `AdamFormer` | Adam (1st/2nd moment) | Lie–Trotter | yes (m, s) | 6 (β₁,β₂,γ × 2) | ~163M |
 | `AdamWFormer` | AdamW (decoupled wd) | Lie–Trotter | yes (m, s) | 8 (β₁,β₂,γ,λ × 2) | ~163M |
 | `MuonFormer` | Muon (orthogonalized momentum) | Lie–Trotter | yes (m) | 4 (β,γ × 2) | ~163M |
-| `SOAPFormer` | SOAP (Kronecker-preconditioned) | Lie–Trotter | yes (m, R) | 6 (β₁,β_R,γ × 2) | ~170M |
+| `SOAPFormer` | SOAP (Kronecker-preconditioned) | Lie–Trotter | yes (m, R) | 6 (β₁,β_R,γ × 2) | ~163M |
 
 **Triple Momentum Method (TMM)** is the first-order optimal algorithm for L-smooth, μ-strongly convex functions (Van Scoy et al. 2018), with convergence rate (1−√(μ/L))² — strictly better than Nesterov. `TMMFormer` generalizes `YuriiFormer` by adding a learnable scalar `ν` that decouples the iterate update from the gradient-evaluation lookahead.
 
@@ -203,22 +203,33 @@ $$
 
 with quintic coefficients $a = 3.4445$, $b = -4.7750$, $c = 2.0315$. After $K \approx 5$ iterations, $Y_K$ approximates the orthogonal polar factor of $m$ (all singular values $\approx 1$). This makes the update **isotropic** — no singular direction dominates, regardless of the gradient spectrum.
 
-**Transformer.** Maintain a momentum stream $M_t$ (from a separate learned embedding) alongside $X_t$. Each layer applies the Muon template twice (Lie–Trotter):
+**Per-token head-wise design.** Applying Newton-Schulz globally across all $T$ positions would mix information across tokens, violating autoregressive causality. Instead, each token's $d$-dimensional representation is reshaped as an $(H, D)$ matrix (where $H = n\_heads = 12$, $D = head\_dim = 64$), and NS is applied independently per token:
+
+$$
+\hat{M}[t] \;=\; \mathrm{reshape}\bigl(M[t],\; (H, D)\bigr), \qquad
+U[t] \;=\; \mathrm{NS}_K\!\bigl(\hat{M}[t]\bigr), \qquad \forall\, t \in \{1, \dots, T\}
+$$
+
+For a short-and-fat matrix $\hat{M}[t] \in \mathbb{R}^{H \times D}$ with $H < D$, the polar factor has $H$ orthonormal rows in the $D$-dimensional subspace — every head gets a unit-norm, mutually orthogonal update within the token. This is **causal by construction**: no cross-token or cross-batch mixing occurs at any step.
+
+**Transformer.** Maintain a momentum stream $M_t \in \mathbb{R}^{B \times T \times H \times D}$ (from a separate learned embedding) alongside $X_t$. Each layer applies the Muon template twice (Lie–Trotter):
 
 $$
 \begin{aligned}
-G^{\text{a}}_t &\;=\; \mathrm{Attn}_t(\mathrm{LN}(X_t)) \\
-M_{t+\frac{1}{2}} &\;=\; \beta_t\, M_t + (1 - \beta_t)\, G^{\text{a}}_t \\
-X_{t+\frac{1}{2}} &\;=\; X_t + \gamma_t\, \mathrm{LN}_u\!\bigl(\mathrm{NS}_K(M_{t+\frac{1}{2}})\bigr) \\[6pt]
+G^{\text{a}}_t &\;=\; \mathrm{Attn}_t(\mathrm{LN}(X_t)) & &\in \mathbb{R}^{B \times T \times d} \\
+\hat{G}^{\text{a}}_t &\;=\; \mathrm{reshape}(G^{\text{a}}_t,\; (B, T, H, D)) \\
+M_{t+\frac{1}{2}} &\;=\; \beta_t\, M_t + (1 - \beta_t)\, \hat{G}^{\text{a}}_t \\
+X_{t+\frac{1}{2}} &\;=\; X_t + \gamma_t\, \mathrm{LN}_u\!\bigl(\mathrm{NS}_K(M_{t+\frac{1}{2}}).\mathrm{reshape}(B, T, d)\bigr) \\[6pt]
 G^{\text{m}}_t &\;=\; \mathrm{MLP}_t(\mathrm{LN}(X_{t+\frac{1}{2}})) \\
-M_{t+1} &\;=\; \beta_{t+\frac{1}{2}}\, M_{t+\frac{1}{2}} + (1 - \beta_{t+\frac{1}{2}})\, G^{\text{m}}_t \\
-X_{t+1} &\;=\; X_{t+\frac{1}{2}} + \gamma_{t+\frac{1}{2}}\, \mathrm{LN}_u\!\bigl(\mathrm{NS}_K(M_{t+1})\bigr)
+\hat{G}^{\text{m}}_t &\;=\; \mathrm{reshape}(G^{\text{m}}_t,\; (B, T, H, D)) \\
+M_{t+1} &\;=\; \beta_{t+\frac{1}{2}}\, M_{t+\frac{1}{2}} + (1 - \beta_{t+\frac{1}{2}})\, \hat{G}^{\text{m}}_t \\
+X_{t+1} &\;=\; X_{t+\frac{1}{2}} + \gamma_{t+\frac{1}{2}}\, \mathrm{LN}_u\!\bigl(\mathrm{NS}_K(M_{t+1}).\mathrm{reshape}(B, T, d)\bigr)
 \end{aligned}
 $$
 
 Four learned scalars per layer ($\beta, \gamma$ per substep). $\beta \in (0,1)$ via sigmoid, $\gamma > 0$ via softplus. The Newton-Schulz iteration count $K = 5$ is a fixed hyperparameter.
 
-**Computational note.** Each NS iteration involves $Y^\top Y$ ($d \times d$ matmul) and right-multiplication, costing $O(T \cdot d^2)$ per iteration. With $K = 5$ iterations per substep, 2 substeps per layer, the overhead is $O(10 \cdot T \cdot d^2)$ per layer — comparable to the MLP cost and smaller than attention's $O(T^2 \cdot d)$.
+**Computational note.** Each NS iteration involves $Y^\top Y$ ($D \times D = 64 \times 64$ matmul) and right-multiplication, costing $O(T \cdot H \cdot D^2)$ per iteration. With $K = 5$ iterations per substep, 2 substeps per layer, the overhead is $O(10 \cdot T \cdot H \cdot D^2)$ per layer — comparable to the MLP cost and smaller than attention's $O(T^2 \cdot d)$.
 
 **Hypothesis.** The forced isotropy of the Muon update may prevent the attention collapse seen in AdamFormer (layer 1 entropy 0.33 nats), since no singular direction in the update can dominate. On the other hand, it may suppress beneficial anisotropy that helps specialization.
 
@@ -228,39 +239,58 @@ Four learned scalars per layer ($\beta, \gamma$ per substep). $\beta \in (0,1)$ 
 
 **Optimizer (Vyas et al., 2024).** SOAP extends Shampoo by applying Adam-style adaptivity in the eigenbasis of the Kronecker-factored gradient covariance. For a matrix iterate $X \in \mathbb{R}^{T \times d}$, full SOAP tracks both a left covariance $L_t \in \mathbb{R}^{T \times T}$ and a right covariance $R_t \in \mathbb{R}^{d \times d}$, then eigendecomposes both to form a preconditioned update.
 
-**Right-factor-only variant.** We drop the left factor $L_t$ (which is $T \times T = 1024 \times 1024$ — expensive to eigendecompose at every layer) and keep only the right covariance $R_t \in \mathbb{R}^{d \times d}$. This captures cross-dimension correlations in the "gradient" signal, while cross-position interactions are already handled by attention. The matrix inverse square root $R_t^{-1/2}$ is approximated via **Newton-Schulz iterations** (same routine as MuonFormer), avoiding explicit eigendecomposition:
+**Right-factor-only, per-token head-wise variant.** We make two simplifications over full SOAP:
+
+1. **Drop the left factor** $L_t \in \mathbb{R}^{T \times T}$: it captures cross-position correlations, which attention already provides. Keeping only the right factor avoids the $O(T^2)$ eigendecomposition at every layer.
+
+2. **Per-token head-wise operation**: to preserve autoregressive causality, all operations are performed independently per token in head space. Each token's $d$-dimensional oracle output is reshaped as $(H, D) = (12, 64)$, and the right covariance $R_t \in \mathbb{R}^{D \times D}$ is tracked per-token in this $64 \times 64$ space (not the full $768 \times 768$). This captures cross-dimension correlations *within* each token's head space — which no other component models — while being causal by construction.
+
+The abstract optimizer template in head space:
 
 $$
 \begin{aligned}
-g_t &\;=\; \nabla f(x_t) \\
-m_{t+1} &\;=\; \beta_{1,t}\, m_t + (1 - \beta_{1,t})\, g_t & &\text{(first moment EMA)}\\
-R_{t+1} &\;=\; \beta_{R,t}\, R_t + (1 - \beta_{R,t})\, g_t^\top g_t & &\text{(right covariance EMA, } d \times d\text{)}\\
+g_t &\;=\; \nabla f(x_t) \in \mathbb{R}^{H \times D} & &\text{(oracle in head space)}\\
+m_{t+1} &\;=\; \beta_{1,t}\, m_t + (1 - \beta_{1,t})\, g_t & &\text{(first moment EMA, } H \times D\text{)}\\
+R_{t+1} &\;=\; \beta_{R,t}\, R_t + (1 - \beta_{R,t})\, g_t^\top g_t & &\text{(right covariance EMA, } D \times D\text{)}\\
 x_{t+1} &\;=\; x_t - \gamma_t\, m_{t+1}\, R_{t+1}^{-1/2} & &\text{(preconditioned update)}
 \end{aligned}
 $$
 
-**Transformer.** Maintain a first-moment stream $M_t \in \mathbb{R}^{T \times d}$ (from a learned embedding) and a right-covariance stream $R_t \in \mathbb{R}^{d \times d}$ (initialized to identity) alongside $X_t$. Each layer applies the SOAP template twice (Lie–Trotter):
+**Newton's iteration for $R^{-1/2}$.** Computing $R^{-1/2}$ via eigendecomposition (`torch.linalg.eigh`) fails in practice: the gradient outer product $g^\top g \in \mathbb{R}^{D \times D}$ has rank $\leq H = 12$, so $R = \beta I + (1-\beta) g^\top g$ has $D - H = 52$ degenerate eigenvalues equal to $\beta$ — a massive eigenvalue multiplicity that causes LAPACK's divide-and-conquer algorithm to fail. Instead, we use Newton's iteration for the matrix inverse square root, which uses only matrix multiplications and is robust to any eigenvalue structure:
 
 $$
 \begin{aligned}
-G^{\text{a}}_t &\;=\; \mathrm{Attn}_t(\mathrm{LN}(X_t)) \\
-M_{t+\frac{1}{2}} &\;=\; \beta_{1,t}\, M_t + (1 - \beta_{1,t})\, G^{\text{a}}_t \\
-R_{t+\frac{1}{2}} &\;=\; \beta_{R,t}\, R_t + (1 - \beta_{R,t})\, (G^{\text{a}}_t)^\top G^{\text{a}}_t \\
-X_{t+\frac{1}{2}} &\;=\; X_t + \gamma_t\, \mathrm{LN}_u\!\bigl(M_{t+\frac{1}{2}}\, \mathrm{NS}^{-1/2}_K(R_{t+\frac{1}{2}})\bigr) \\[6pt]
-G^{\text{m}}_t &\;=\; \mathrm{MLP}_t(\mathrm{LN}(X_{t+\frac{1}{2}})) \\
-M_{t+1} &\;=\; \beta_{1,t+\frac{1}{2}}\, M_{t+\frac{1}{2}} + (1 - \beta_{1,t+\frac{1}{2}})\, G^{\text{m}}_t \\
-R_{t+1} &\;=\; \beta_{R,t+\frac{1}{2}}\, R_{t+\frac{1}{2}} + (1 - \beta_{R,t+\frac{1}{2}})\, (G^{\text{m}}_t)^\top G^{\text{m}}_t \\
-X_{t+1} &\;=\; X_{t+\frac{1}{2}} + \gamma_{t+\frac{1}{2}}\, \mathrm{LN}_u\!\bigl(M_{t+1}\, \mathrm{NS}^{-1/2}_K(R_{t+1})\bigr)
+R_{\text{reg}} &\;=\; R + \varepsilon I, \qquad R_{\text{norm}} \;=\; R_{\text{reg}} / \|R_{\text{reg}}\|_F \\
+X_0 &\;=\; I \\
+X_{k+1} &\;=\; \tfrac{1}{2}\, X_k \bigl(3 I - X_k\, R_{\text{norm}}\, X_k\bigr), \qquad k = 0, \dots, K-1 \\
+R^{-1/2} &\;\approx\; X_K / \sqrt{\|R_{\text{reg}}\|_F}
 \end{aligned}
 $$
 
-where $\mathrm{NS}^{-1/2}_K(R)$ denotes $K$ Newton-Schulz iterations approximating $R^{-1/2}$.
+The Frobenius normalization puts the eigenvalues near 1, ensuring quadratic convergence from $X_0 = I$. With $K = 10$ iterations, the approximation is accurate to machine precision for the $64 \times 64$ matrices involved.
 
-Six learned scalars per layer ($\beta_1, \beta_R, \gamma$ per substep). $\beta_1, \beta_R \in (0,1)$ via sigmoid, $\gamma > 0$ via softplus. $R_0 = I_d$ (identity); $M_0$ from learned embeddings.
+**Transformer.** Maintain a first-moment stream $M_t \in \mathbb{R}^{B \times T \times H \times D}$ (from a learned embedding) and a per-token right-covariance stream $R_t \in \mathbb{R}^{B \times T \times D \times D}$ (initialized to $I_D$) alongside $X_t$. Each layer applies the SOAP template twice (Lie–Trotter):
 
-**Why right-factor only?** The left covariance $L_t \in \mathbb{R}^{T \times T}$ captures cross-position correlations — but attention already provides exactly this. The right covariance $R_t \in \mathbb{R}^{d \times d}$ captures cross-dimension correlations, which no other component models. This asymmetry makes the right-factor-only variant both efficient and non-redundant.
+$$
+\begin{aligned}
+G^{\text{a}}_t &\;=\; \mathrm{reshape}\bigl(\mathrm{Attn}_t(\mathrm{LN}(X_t)),\; (B, T, H, D)\bigr) \\
+M_{t+\frac{1}{2}} &\;=\; \beta_{1,t}\, M_t + (1 - \beta_{1,t})\, G^{\text{a}}_t \\
+R_{t+\frac{1}{2}} &\;=\; \beta_{R,t}\, R_t + (1 - \beta_{R,t})\, (G^{\text{a}}_t)^\top G^{\text{a}}_t & &\text{(per-token, } D \times D\text{)}\\
+X_{t+\frac{1}{2}} &\;=\; X_t + \gamma_t\, \mathrm{LN}_u\!\bigl((M_{t+\frac{1}{2}}\, R_{t+\frac{1}{2}}^{-1/2}).\mathrm{reshape}(B, T, d)\bigr) \\[6pt]
+G^{\text{m}}_t &\;=\; \mathrm{reshape}\bigl(\mathrm{MLP}_t(\mathrm{LN}(X_{t+\frac{1}{2}})),\; (B, T, H, D)\bigr) \\
+M_{t+1} &\;=\; \beta_{1,t+\frac{1}{2}}\, M_{t+\frac{1}{2}} + (1 - \beta_{1,t+\frac{1}{2}})\, G^{\text{m}}_t \\
+R_{t+1} &\;=\; \beta_{R,t+\frac{1}{2}}\, R_{t+\frac{1}{2}} + (1 - \beta_{R,t+\frac{1}{2}})\, (G^{\text{m}}_t)^\top G^{\text{m}}_t \\
+X_{t+1} &\;=\; X_{t+\frac{1}{2}} + \gamma_{t+\frac{1}{2}}\, \mathrm{LN}_u\!\bigl((M_{t+1}\, R_{t+1}^{-1/2}).\mathrm{reshape}(B, T, d)\bigr)
+\end{aligned}
+$$
 
-**Parameters.** The $R_t$ covariance stream adds $12 \times d^2 = 12 \times 768^2 \approx 7\text{M}$ state elements (not trained — evolved per-layer), bringing the total to ~170M.
+where $R^{-1/2}$ is computed via $K = 10$ Newton iterations as described above.
+
+Six learned scalars per layer ($\beta_1, \beta_R, \gamma$ per substep). $\beta_1, \beta_R \in (0,1)$ via sigmoid, $\gamma > 0$ via softplus. $R_0 = I_D$ (identity in head-dim space); $M_0$ from learned embeddings.
+
+**Why right-factor only?** The left covariance $L_t \in \mathbb{R}^{T \times T}$ captures cross-position correlations — but attention already provides exactly this. The right covariance $R_t \in \mathbb{R}^{D \times D}$ captures cross-dimension correlations within each token's head space, which no other component models. This asymmetry makes the right-factor-only variant both efficient and non-redundant.
+
+**Parameters.** The per-token $R_t$ covariance stream occupies $B \times T \times D^2 = B \times 1024 \times 64^2$ elements as runtime state (not trained parameters — evolved per-layer). The model has ~163M trained parameters, matching MuonFormer.
 
 **Why SOAP over Shampoo?** Both share the same expensive component (Kronecker covariance tracking + matrix inverse square root). SOAP adds Adam-style first-moment tracking in the preconditioned space — cheap (element-wise) but strictly better for convergence, since it provides per-direction adaptivity that raw Shampoo lacks.
 
@@ -270,7 +300,7 @@ Six learned scalars per layer ($\beta_1, \beta_R, \gamma$ per substep). $\beta_1
 
 - **Velocity / update LayerNorm.** $\mathrm{LN}_v$ (in YuriiFormer / TMMFormer) and $\mathrm{LN}_u$ (in AdamFormer / AdamWFormer / MuonFormer / SOAPFormer) are essential for stability across depth: without them, momentum-based architectures diverge after a few hundred steps.
 - **Auxiliary stream initialization.** $V_0$ and $M_0$ are produced by *separate learned embeddings* (`vel_tok_emb + vel_pos_emb`, etc.), not by zero-initialization. $S_0$ is initialized to all-ones. $R_0$ (SOAPFormer's right covariance) is initialized to identity.
-- **Newton-Schulz iterations.** MuonFormer and SOAPFormer both use $K = 5$ iterations of the quintic Newton-Schulz recurrence — for polar-factor extraction (MuonFormer) and matrix inverse square root (SOAPFormer), respectively.
+- **Newton-Schulz / Newton iterations.** MuonFormer uses $K = 5$ quintic Newton-Schulz iterations for polar-factor extraction ($H \times D$ per token). SOAPFormer uses $K = 10$ Newton iterations for the matrix inverse square root $R^{-1/2}$ ($D \times D$ per token) — a different algorithm using only matmuls, chosen because eigendecomposition fails on $R$'s highly degenerate spectrum (52 of 64 eigenvalues coincide).
 - **Two-optimizer training.** All learned per-layer scalars (the `*_raw` parameters) are trained by AdamW at a higher LR ($3 \cdot 10^{-3}$) than the rest of the network. Matrix weights use **Muon**; embeddings, LayerNorm, and scalars use **AdamW**.
 - **Weight tying** with `tok_emb` for the output projection in every variant.
 

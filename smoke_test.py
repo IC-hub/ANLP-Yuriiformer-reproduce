@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from data import load_tokens, TinyStoriesDataset, ValidationDataset
 from muon_model import MuonFormer
+from soap_model import SOAPFormer
 
 BLOCK_SIZE = 1024
 BATCH_SIZE = 2
@@ -63,25 +64,57 @@ def configure_optimizers(model):
     return opt_muon, opt_adamw
 
 
-# Causality check first: changing a future token must not affect earlier logits
-print("\n=== Causality check ===")
-with torch.no_grad():
-    m_check = MuonFormer().to(device).eval()
-    B, T = 1, 16
-    torch.manual_seed(0)
-    x1 = torch.randint(0, 50304, (B, T), device=device)
-    x2 = x1.clone()
-    x2[0, T - 1] = (x1[0, T - 1] + 1) % 50304
-    l1 = m_check(x1)
-    l2 = m_check(x2)
-    diffs = (l1[:, :-1] - l2[:, :-1]).abs().max().item()
-    status = "✓ CAUSAL" if diffs < 1e-4 else "✗ LEAKS FUTURE"
-    print(f"MuonFormer: max diff on positions 0..{T-2} = {diffs:.2e}  {status}")
-    del m_check
-    torch.cuda.empty_cache()
-    assert diffs < 1e-4, f"CAUSALITY VIOLATION: diff = {diffs}"
+# ── Causality check ─────────────────────────────────────────────────────
+# Strong check: multiple change positions, verify past preserved + position
+# k itself responds + no cross-batch leak. Full training length T=1024.
 
-for name, ModelCls in [("MuonFormer", MuonFormer)]:
+CHANGE_POSITIONS = [3, 63, 255, 511, 1023]
+TOL = 1e-4
+
+print("\n=== Causality check ===")
+for name, cls in [("MuonFormer", MuonFormer), ("SOAPFormer", SOAPFormer)]:
+    model = cls().to(device).eval()
+    torch.manual_seed(0)
+    B_test, T_test = 2, 1024
+    x1 = torch.randint(0, 50304, (B_test, T_test), device=device)
+
+    all_pass = True
+    with torch.no_grad():
+        logits1 = model(x1)
+        for k in CHANGE_POSITIONS:
+            x2 = x1.clone()
+            x2[0, k] = (x1[0, k] + 1) % 50304
+            logits2 = model(x2)
+
+            past_diff = (logits1[0, :k] - logits2[0, :k]).abs().max().item() if k > 0 else 0.0
+            at_k_diff = (logits1[0, k] - logits2[0, k]).abs().max().item()
+            batch_diff = (logits1[1] - logits2[1]).abs().max().item()
+
+            past_ok = past_diff < TOL
+            at_k_ok = at_k_diff > TOL
+            batch_ok = batch_diff < TOL
+            ok = past_ok and at_k_ok and batch_ok
+            if not ok:
+                all_pass = False
+
+            flag = "✓" if ok else "✗"
+            print(f"  {name} k={k:4d}: past={past_diff:.2e} "
+                  f"{'OK' if past_ok else 'LEAK':4s}  "
+                  f"at_k={at_k_diff:.2e} "
+                  f"{'OK' if at_k_ok else 'DEAD':4s}  "
+                  f"batch={batch_diff:.2e} "
+                  f"{'OK' if batch_ok else 'XBAT':4s} {flag}")
+
+    verdict = "✓ CAUSAL" if all_pass else "✗ BROKEN"
+    print(f"  {name}: {verdict}")
+    assert all_pass, f"{name} CAUSALITY VIOLATION"
+    del model
+    torch.cuda.empty_cache()
+
+
+# ── Training smoke test ─────────────────────────────────────────────────
+
+for name, ModelCls in [("MuonFormer", MuonFormer), ("SOAPFormer", SOAPFormer)]:
     print(f"\n{'=' * 60}")
     print(f"Smoke test: {name}")
     print(f"{'=' * 60}")
