@@ -23,8 +23,8 @@ from soap_model import SOAPFormer
 # ── Hyperparameters ──────────────────────────────────────────────────────────
 TOTAL_STEPS = 10_000
 WARMUP_STEPS = 1_000
-BATCH_SIZE = 8
-TOTAL_GRAD_ACCUM = 60  # total micro-steps across all GPUs
+BATCH_SIZE = 4  # reduced from 8 for SOAPFormer's per-token R covariance memory
+TOTAL_GRAD_ACCUM = 120  # doubled to keep effective batch = 480
 BLOCK_SIZE = 1024
 GRAD_CLIP = 1.0
 

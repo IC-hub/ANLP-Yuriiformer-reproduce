@@ -317,10 +317,11 @@ Six learned scalars per layer ($\beta_1, \beta_R, \gamma$ per substep). $\beta_1
 | **TMMFormer** (ours) | **1.1284** | 1.1387 | 0.8464 |
 | YuriiFormer (ours) | 1.1299 | 1.1384 | 0.8497 |
 | AdamWFormer (ours) | 1.1472 | 1.1547 | — |
+| MuonFormer (ours) | 1.1503 | 1.1540 | 0.9061 |
 | AdamFormer (ours) | 1.1528 | 1.1554 | — |
 | VanillaTransformer (ours) | 1.1569 | 1.1604 | 0.9418 |
 
-**TS observations**: TMM and YuriiFormer are statistically tied (Δ = 0.0015), both clearly ahead of Adam-style variants and Vanilla. Our reproduction loss (~1.13) is higher than paper YuriiFormer (1.078) — a systematic Muon/effective-batch hyperparameter offset — but **relative comparisons under matched setup remain valid**. The extra ν freedom in TMM neither helps nor hurts at 10k steps.
+**TS observations**: TMM and YuriiFormer are statistically tied (Δ = 0.0015), both clearly ahead of Adam-style variants and Vanilla. MuonFormer lands between AdamWFormer and AdamFormer — the forced isotropy from Newton-Schulz orthogonalization (all singular values ≈ 1) appears to mildly constrain expressiveness compared to Nesterov's anisotropic momentum, but outperforms the vanilla baseline and AdamFormer. Our reproduction loss (~1.13) is higher than paper YuriiFormer (1.078) — a systematic Muon/effective-batch hyperparameter offset — but **relative comparisons under matched setup remain valid**.
 
 ### OpenWebText (30k steps)
 
