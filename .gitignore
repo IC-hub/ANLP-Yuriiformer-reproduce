@@ -1,0 +1,10 @@
+logs/
+checkpoints/
+wandb/
+__pycache__/
+*.log
+eval_results/
+plots/checkpoints_*/
+eval_results_*/
+*.pt
+*.npy
